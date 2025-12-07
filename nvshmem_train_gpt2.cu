@@ -1912,6 +1912,12 @@ int main(int argc, char *argv[]) {
   attr.mpi_comm = &mpi_comm;
   nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
 
+  // CRITICAL: Wait for NVSHMEM initialization to complete on all PEs
+  // before making any NVSHMEM API calls (including nvshmem_my_pe,
+  // nvshmem_malloc, etc.)
+  cudaDeviceSynchronize();
+  nvshmem_barrier_all();
+
   int my_pe = nvshmem_my_pe();
   int n_pes = nvshmem_n_pes();
 
