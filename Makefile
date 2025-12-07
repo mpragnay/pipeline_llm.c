@@ -304,10 +304,10 @@ test_nvshmem: test_nvshmem_basic.cu
 # Run with: NVSHMEM_BOOTSTRAP=MPI mpirun -np 2 ./nvshmem_train_gpt2 -b 4 -t 128
 nvshmem_train_gpt2: nvshmem_train_gpt2.cu
 	$(NVCC) --threads=0 -t=0 --use_fast_math -std=c++17 -O3 \
-		-arch=sm_80 \
+		-arch=sm_80 -rdc=true --extended-lambda --expt-relaxed-constexpr \
 		-I$(NVSHMEM_HOME)/include -L$(NVSHMEM_HOME)/lib \
 		-I$(OPENMPI_INCLUDE_PATH) -L$(OPENMPI_LIB_PATH) \
-		$^ -lnvshmem -lcublas -lcublasLt -lcudart -lnvidia-ml -lmpi $(CUDA_OUTPUT_FILE)
+		$^ -lnvshmem_host -lnvshmem_device -lcublas -lcublasLt -lcuda -lcudart -lnvidia-ml -lmpi $(CUDA_OUTPUT_FILE)
 
 
 clean:
