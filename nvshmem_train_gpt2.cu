@@ -2072,6 +2072,13 @@ int main(int argc, char *argv[]) {
            (int)round(model.num_parameters * sizeof(float) / (1024 * 1024)));
   }
 
+  // Allocate NVSHMEM buffers BEFORE the first forward pass
+  // The forward pass will use nvshmem_putmem, so buffers must exist first
+  int C = model.config.channels;
+  model.batch_size = B;
+  model.seq_len = T;
+  gpt2_allocate_nvshmem_buffers(&model);
+
   // Do a dummy forward pass to allocate activations
   int *dummy_batch = (int *)malloc(B * T * sizeof(int));
   for (int i = 0; i < B * T; i++) {
@@ -2079,9 +2086,6 @@ int main(int argc, char *argv[]) {
   }
   gpt2_forward(&model, dummy_batch, NULL, B, T);
   free(dummy_batch);
-
-  // Now allocate NVSHMEM buffers after we know batch size
-  gpt2_allocate_nvshmem_buffers(&model);
 
   // set up the Logger
   Logger logger;
