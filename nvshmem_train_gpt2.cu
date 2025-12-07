@@ -1435,6 +1435,15 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     nvshmem_putmem(model->nvshmem_act_buffer, layer5_output,
                    B * T * C * sizeof(float), 1); // PE 1
     nvshmem_quiet();
+
+    // GPU 0 doesn't compute loss, but needs to set mean_loss for backward pass
+    // If targets provided, set to a valid value (GPU 1 has the actual loss)
+    // If no targets (inference), set to -1.0
+    if (targets != NULL) {
+      model->mean_loss = 0.0f; // Valid placeholder for backward check
+    } else {
+      model->mean_loss = -1.0f; // No targets, inference mode
+    }
   }
 
   // GPU 1: Layers 6-11 + Final LayerNorm + Loss
