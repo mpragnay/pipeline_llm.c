@@ -1867,20 +1867,6 @@ void gpt2_backward(GPT2 *model) {
                          model->num_parameters * sizeof(float),
                          cudaMemcpyDeviceToDevice));
     cudaCheck(cudaDeviceSynchronize());
-
-    // Debug: Check gradient norm after sync
-    if (my_pe == 0) {
-      float grad_sum = 0.0f;
-      float *cpu_grads = (float *)malloc(model->num_parameters * sizeof(float));
-      cudaMemcpy(cpu_grads, model->grads_memory,
-                 model->num_parameters * sizeof(float), cudaMemcpyDeviceToHost);
-      for (int i = 0; i < 1000; i++) { // Check first 1000 gradients
-        grad_sum += fabsf(cpu_grads[i]);
-      }
-      printf("[DEBUG PE %d] Gradient sum (first 1000): %.6f\n", my_pe,
-             grad_sum);
-      free(cpu_grads);
-    }
   }
 }
 
@@ -2325,8 +2311,8 @@ int main(int argc, char *argv[]) {
     // do a training step
     clock_gettime(CLOCK_MONOTONIC, &start);
     dataloader_next_batch(&train_loader);
-    gpt2_zero_grad(&model); // Zero gradients BEFORE forward pass
     gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+    gpt2_zero_grad(&model);
     gpt2_backward(&model);
     gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step + 1);
     cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct
