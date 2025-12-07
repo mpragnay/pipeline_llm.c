@@ -71,7 +71,7 @@ void ncclCheck(ncclResult_t status, const char *file, int line) {
     exit(EXIT_FAILURE);
   }
 }
-#define ncclCheck(err) (ncclCheck(err, _FILE_, _LINE_))
+#define ncclCheck(err) (ncclCheck(err, __FILE__, __LINE__))
 
 #define cublasCheck(status)                                                    \
   {                                                                            \
