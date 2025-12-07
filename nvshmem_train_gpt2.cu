@@ -1780,6 +1780,20 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
   }
 
+  // Debug: Check wte gradients before sync
+  {
+    float wte_grad_sum = 0.0f;
+    float *cpu_wte_grads = (float *)malloc(1000 * sizeof(float));
+    cudaMemcpy(cpu_wte_grads, model->grads.wte, 1000 * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    for (int i = 0; i < 1000; i++) {
+      wte_grad_sum += fabsf(cpu_wte_grads[i]);
+    }
+    printf("[DEBUG PE %d] WTE grad sum BEFORE sync: %.6f\n", my_pe,
+           wte_grad_sum);
+    free(cpu_wte_grads);
+  }
+
   // Synchronize gradients across all GPUs
   // Each GPU has computed gradients for its subset of layers
   // We need to sum all gradients so both GPUs have complete gradients
@@ -1867,6 +1881,20 @@ void gpt2_backward(GPT2 *model) {
                          model->num_parameters * sizeof(float),
                          cudaMemcpyDeviceToDevice));
     cudaCheck(cudaDeviceSynchronize());
+  }
+
+  // Debug: Check wte gradients after sync
+  {
+    float wte_grad_sum = 0.0f;
+    float *cpu_wte_grads = (float *)malloc(1000 * sizeof(float));
+    cudaMemcpy(cpu_wte_grads, model->grads.wte, 1000 * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    for (int i = 0; i < 1000; i++) {
+      wte_grad_sum += fabsf(cpu_wte_grads[i]);
+    }
+    printf("[DEBUG PE %d] WTE grad sum AFTER sync: %.6f\n", my_pe,
+           wte_grad_sum);
+    free(cpu_wte_grads);
   }
 }
 
