@@ -1453,9 +1453,11 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     nvshmem_barrier_all();
 
     // Copy received activations from GPU 0's symmetric buffer
+    // Since GPU 0 put the data into our (GPU 1's) symmetric buffer, we just
+    // copy it locally
     float *layer5_output = acts.residual3 + 5 * B * T * C;
-    nvshmem_getmem(layer5_output, model->nvshmem_act_buffer,
-                   B * T * C * sizeof(float), 0); // From PE 0
+    cudaCheck(cudaMemcpy(layer5_output, model->nvshmem_act_buffer,
+                         B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
 
     // Process layers 6-11
     for (int l = 6; l < L; l++) {
@@ -1696,8 +1698,10 @@ void gpt2_backward(GPT2 *model) {
     nvshmem_barrier_all();
 
     // Copy received gradients from GPU 1's symmetric buffer
-    nvshmem_getmem(dresidual, model->nvshmem_grad_buffer,
-                   B * T * C * sizeof(float), 1); // From PE 1
+    // Since GPU 1 put the data into our (GPU 0's) symmetric buffer, we just
+    // copy it locally
+    cudaCheck(cudaMemcpy(dresidual, model->nvshmem_grad_buffer,
+                         B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
 
     // Backward through layers 5-0
     for (int l = 5; l >= 0; l--) {
