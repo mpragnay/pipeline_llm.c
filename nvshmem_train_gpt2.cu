@@ -27,6 +27,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <cuda_runtime.h>
 // NVSHMEM for multi-GPU communication
 #include <mpi.h>
+#include <nccl.h>
 #include <nvshmem.h>
 #include <nvshmemx.h>
 // our own utilities
@@ -61,6 +62,17 @@ void cublasCheck(cublasStatus_t status, const char *file, int line) {
     exit(EXIT_FAILURE);
   }
 }
+
+// NCCL error checking
+void ncclCheck(ncclResult_t status, const char *file, int line) {
+  if (status != ncclSuccess) {
+    printf("[NCCL ERROR] at file %s:%d:\n%s\n", file, line,
+           ncclGetErrorString(status));
+    exit(EXIT_FAILURE);
+  }
+}
+#define ncclCheck(err) (ncclCheck(err, _FILE_, _LINE_))
+
 #define cublasCheck(status)                                                    \
   {                                                                            \
     cublasCheck((status), __FILE__, __LINE__);                                 \
@@ -1198,6 +1210,7 @@ typedef struct {
   float *nvshmem_act_buffer;  // Symmetric buffer for activations (B*T*C floats)
   float *nvshmem_grad_buffer; // Symmetric buffer for gradients (B*T*C floats)
   size_t nvshmem_buffer_size; // Size in bytes
+  ncclComm_t nccl_comm;
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path) {
@@ -1824,6 +1837,8 @@ void gpt2_free(GPT2 *model) {
   cudaCheck(cudaFree(model->inputs));
   cudaCheck(cudaFree(model->targets));
   cudaFreeHost(model->cpu_losses);
+  // Clean up NCCL communicator
+  ncclCommDestroy(model->nccl_comm);
 }
 
 #ifndef TESTING
@@ -1964,6 +1979,15 @@ int main(int argc, char *argv[]) {
   cudaDeviceSynchronize();
   nvshmem_barrier_all();
 
+  // Initialize NCCL for all-reduce operations
+  ncclUniqueId nccl_id;
+  if (my_pe == 0) {
+    ncclCheck(ncclGetUniqueId(&nccl_id));
+  }
+  MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD);
+  ncclComm_t nccl_comm;
+  ncclCheck(ncclCommInitRank(&nccl_comm, n_pes, nccl_id, my_pe));
+
   // read in the (optional) command line arguments
   const char *train_data_pattern =
       "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
@@ -2059,6 +2083,7 @@ int main(int argc, char *argv[]) {
   // build the GPT-2 model from a checkpoint
   GPT2 model;
   gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+  model.nccl_comm = nccl_comm;
   if (my_pe == 0) {
     printf("| max_sequence_length T | %-50d |\\n", model.config.max_seq_len);
     printf("| vocab_size V          | %-50d |\\n", model.config.vocab_size);
