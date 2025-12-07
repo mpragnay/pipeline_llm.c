@@ -1489,21 +1489,21 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
       residual_forward(l_residual3, l_residual2, l_fcproj, B * T * C);
     }
 
-    // Copy layer 5 output to symmetric buffer using nvshmem_putmem_nbi (non-blocking)
-    // We put from local CUDA memory directly to remote PE's symmetric buffer
+    // Copy layer 5 output to GPU 1's symmetric buffer directly
     float *layer5_output = acts.residual3 + 5 * B * T * C;
-    
-    // Only do NVSHMEM transfer if buffers are allocated (skip during dummy forward)
-    if (model->nvshmem_act_buffer != NULL) {
-      // First copy to local symmetric buffer
-      cudaDeviceSynchronize();  // Ensure layer 5 computation is complete
-      
-      // Use nvshmem_putmem to transfer directly to PE 1's symmetric buffer
-      // Source is local device memory, destination is PE 1's symmetric buffer
-      nvshmem_float_put(model->nvshmem_act_buffer, layer5_output, B * T * C, 1);
-      nvshmem_quiet();  // Ensure transfer completes
-      
-      MPI_Barrier(MPI_COMM_WORLD);  // Sync with PE 1
+
+    // Use nvshmem_putmem to transfer directly to PE 1
+    nvshmem_putmem(model->nvshmem_act_buffer, layer5_output,
+                   B * T * C * sizeof(float), 1); // PE 1
+    nvshmem_quiet();
+
+    // GPU 0 doesn't compute loss, but needs to set mean_loss for backward pass
+    // If targets provided, set to a valid value (GPU 1 has the actual loss)
+    // If no targets (inference), set to -1.0
+    if (targets != NULL) {
+      model->mean_loss = 0.0f; // Valid placeholder for backward check
+    } else {
+      model->mean_loss = -1.0f; // No targets, inference mode
     }
   }
 
@@ -1514,12 +1514,10 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
       // Wait for GPU 0 to complete transfer
       MPI_Barrier(MPI_COMM_WORLD);  // Use MPI barrier for synchronization
 
-    // The data from PE 0 is now in our local nvshmem_act_buffer
-    // Copy from our symmetric buffer to the activation tensor
+    // Copy received activations from GPU 0's symmetric buffer
     float *layer5_output = acts.residual3 + 5 * B * T * C;
-    cudaMemcpyAsync(layer5_output, model->nvshmem_act_buffer,
-                    B * T * C * sizeof(float), cudaMemcpyDeviceToDevice, 0);
-    cudaDeviceSynchronize();
+    nvshmem_getmem(layer5_output, model->nvshmem_act_buffer,
+                   B * T * C * sizeof(float), 0); // From PE 0
 
     // Process layers 6-11
     for (int l = 6; l < L; l++) {
@@ -1744,13 +1742,9 @@ void gpt2_backward(GPT2 *model) {
                          l_ln1_mean, l_ln1_rstd, B, T, C);
     }
 
-    // Copy gradients to symmetric buffer
-    cudaCheck(cudaMemcpy(model->nvshmem_grad_buffer, dresidual,
-                         B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
-
-    // Transfer to GPU 0
-    nvshmem_float_put(model->nvshmem_grad_buffer, model->nvshmem_grad_buffer,
-                      B * T * C, 0); // PE 0
+    // Transfer gradients to GPU 0 using nvshmem_putmem
+    nvshmem_putmem(model->nvshmem_grad_buffer, dresidual,
+                   B * T * C * sizeof(float), 0); // PE 0
     nvshmem_quiet();
   }
 
@@ -1759,9 +1753,9 @@ void gpt2_backward(GPT2 *model) {
     // Wait for GPU 1 to send gradients
     nvshmem_barrier_all();
 
-    // Copy received gradients
-    cudaCheck(cudaMemcpy(dresidual, model->nvshmem_grad_buffer,
-                         B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
+    // Copy received gradients from GPU 1's symmetric buffer
+    nvshmem_getmem(dresidual, model->nvshmem_grad_buffer,
+                   B * T * C * sizeof(float), 1); // From PE 1
 
     // Backward through layers 5-0
     for (int l = 5; l >= 0; l--) {
@@ -1839,7 +1833,8 @@ void gpt2_backward(GPT2 *model) {
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
                  float eps, float weight_decay, int t) {
-  // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
+  // reference:
+  // https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
   // lazily allocate the memory for m_memory and v_memory
   if (model->m_memory == NULL) {
@@ -1974,9 +1969,8 @@ void error_usage() {
                   "estimate val loss? (default = 20)\n");
   fprintf(stderr, "  -s <int>    sample_every, how often we inference the "
                   "model (default = 20)\n");
-  fprintf(
-      stderr,
-      "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+  fprintf(stderr, "  -g <int>    genT, how many steps of inference we do "
+                  "(default = 64)\n");
   exit(EXIT_FAILURE);
 }
 
@@ -1993,6 +1987,7 @@ int main(int argc, char *argv[]) {
   attr.mpi_comm = &mpi_comm;
   nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
 
+  // Get PE information (safe to call immediately after init_attr)
   int my_pe = nvshmem_my_pe();
   int n_pes = nvshmem_n_pes();
 
@@ -2008,10 +2003,15 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Set GPU device based on PE
+  // CRITICAL: Set GPU device BEFORE barrier
+  // Each PE must have its CUDA context on the correct device
   cudaCheck(cudaSetDevice(my_pe));
   cudaDeviceProp deviceProp;
   cudaGetDeviceProperties(&deviceProp, my_pe);
+
+  // Now synchronize - all PEs have their devices set
+  cudaDeviceSynchronize();
+  nvshmem_barrier_all();
 
   // read in the (optional) command line arguments
   const char *train_data_pattern =
@@ -2089,7 +2089,8 @@ int main(int argc, char *argv[]) {
 
   // setup cuBLAS and cuBLASLt
   cublasCheck(cublasCreate(&cublas_handle));
-  // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
+  // TF32 precision is equivalent to
+  // torch.set_float32_matmul_precision('high')
   int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
   cublas_compute_type =
       enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
@@ -2139,12 +2140,19 @@ int main(int argc, char *argv[]) {
            "\\n");
   }
 
-  // print model parameter allocations from gpt2_build_from_checkpoint down here
-  // to not mess up our table above
+  // print model parameter allocations from gpt2_build_from_checkpoint down
+  // here to not mess up our table above
   if (my_pe == 0) {
     printf("allocated %d MiB for model parameters\\n",
            (int)round(model.num_parameters * sizeof(float) / (1024 * 1024)));
   }
+
+  // Allocate NVSHMEM buffers BEFORE the first forward pass
+  // The forward pass will use nvshmem_putmem, so buffers must exist first
+  int C = model.config.channels;
+  model.batch_size = B;
+  model.seq_len = T;
+  gpt2_allocate_nvshmem_buffers(&model);
 
   // Do a dummy forward pass to allocate activations
   int *dummy_batch = (int *)malloc(B * T * sizeof(int));
@@ -2153,9 +2161,6 @@ int main(int argc, char *argv[]) {
   }
   gpt2_forward(&model, dummy_batch, NULL, B, T);
   free(dummy_batch);
-
-  // Now allocate NVSHMEM buffers after we know batch size
-  gpt2_allocate_nvshmem_buffers(&model);
 
   // set up the Logger
   Logger logger;
@@ -2202,13 +2207,14 @@ int main(int argc, char *argv[]) {
       for (int t = 1; t < genT; t++) {
         // note that inference is very wasteful here because for each token
         // we re-calculate the forward pass for all of (B,T) positions from
-        // scratch but the inference here is just for sanity checking anyway and
-        // we can maybe optimize a bit more later, with careful tests
+        // scratch but the inference here is just for sanity checking anyway
+        // and we can maybe optimize a bit more later, with careful tests
         gpt2_forward(&model, gen_tokens, NULL, B, T);
-        // furthermore, below we're only using b=0 (i.e. the first row) of all B
-        // rows we're in principle running B "inference streams" in parallel
-        // here only using position 0 because it's a bit faster (copy less probs
-        // from GPU -> CPU) get the V-dimensional vector probs[0, t-1, :]
+        // furthermore, below we're only using b=0 (i.e. the first row) of all
+        // B rows we're in principle running B "inference streams" in parallel
+        // here only using position 0 because it's a bit faster (copy less
+        // probs from GPU -> CPU) get the V-dimensional vector probs[0, t-1,
+        // :]
         float *logits =
             model.acts.output + (t - 1) * model.config.padded_vocab_size;
         // move probs back to CPU and sample (note we only move the first
@@ -2236,8 +2242,8 @@ int main(int argc, char *argv[]) {
     // bit confusing: we want to make sure to eval and sample on 0th iteration
     // but also after the very last iteration. so we loop for step <=
     // train_num_batches instead of just < train_num_batches (one extra due to
-    // <=), only to do the validation/sampling one last time, and then we break
-    // right here as we're done.
+    // <=), only to do the validation/sampling one last time, and then we
+    // break right here as we're done.
     if (last_step) {
       break;
     }
