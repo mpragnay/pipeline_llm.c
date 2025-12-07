@@ -300,6 +300,16 @@ test_nvshmem: test_nvshmem_basic.cu
 		-I$(OPENMPI_INCLUDE_PATH) -L$(OPENMPI_LIB_PATH) \
 		$^ -lnvshmem_host -lnvshmem_device -lcuda -lnvidia-ml -lcudart -lmpi $(CUDA_OUTPUT_FILE)
 
+# NVSHMEM Pipeline Training Target (Phase 1)
+# Run with: NVSHMEM_BOOTSTRAP=MPI mpirun -np 2 ./nvshmem_train_gpt2 -b 4 -t 128
+nvshmem_train_gpt2: nvshmem_train_gpt2.cu
+	$(NVCC) --threads=0 -t=0 --use_fast_math -std=c++17 -O3 \
+		-arch=sm_80 \
+		-I$(NVSHMEM_HOME)/include -L$(NVSHMEM_HOME)/lib \
+		-I$(OPENMPI_INCLUDE_PATH) -L$(OPENMPI_LIB_PATH) \
+		$^ -lnvshmem -lcublas -lcublasLt -lcudart -lnvidia-ml -lmpi $(CUDA_OUTPUT_FILE)
+
+
 clean:
-	$(REMOVE_FILES) $(TARGETS) test_nccl test_nvshmem
+	$(REMOVE_FILES) $(TARGETS) test_nccl test_nvshmem nvshmem_train_gpt2
 	$(REMOVE_BUILD_OBJECT_FILES)
