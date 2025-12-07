@@ -285,6 +285,21 @@ test_gpt2fp32cu: test_gpt2_fp32.cu
 profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE)
 
+# NCCL test target
+test_nccl: test_nccl_basic.cu
+	$(NVCC) $(NVCC_FLAGS) $^ -lnccl -lcudart $(CUDA_OUTPUT_FILE)
+
+# NVSHMEM test target
+# Run with: NVSHMEM_BOOTSTRAP=MPI mpirun -np 2 ./test_nvshmem
+# NVSHMEM requires sm_80+ for system-scope atomics and extended C++ features
+NVSHMEM_HOME ?= /usr/local/nvshmem
+test_nvshmem: test_nvshmem_basic.cu
+	$(NVCC) --threads=0 -t=0 --use_fast_math -std=c++17 -O3 \
+		-arch=sm_80 --extended-lambda --expt-relaxed-constexpr \
+		-rdc=true -I$(NVSHMEM_HOME)/include -L$(NVSHMEM_HOME)/lib \
+		-I$(OPENMPI_INCLUDE_PATH) -L$(OPENMPI_LIB_PATH) \
+		$^ -lnvshmem_host -lnvshmem_device -lcuda -lnvidia-ml -lcudart -lmpi $(CUDA_OUTPUT_FILE)
+
 clean:
-	$(REMOVE_FILES) $(TARGETS)
+	$(REMOVE_FILES) $(TARGETS) test_nccl test_nvshmem
 	$(REMOVE_BUILD_OBJECT_FILES)
