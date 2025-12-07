@@ -1780,7 +1780,7 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
   }
 
-  // Synchronize gradients across all GPUs using allreduce
+  // Synchronize gradients across all GPUs
   // Each GPU has computed gradients for its subset of layers
   // We need to sum all gradients so both GPUs have complete gradients
   nvshmem_barrier_all(); // Ensure all GPUs finished backward pass
@@ -1789,24 +1789,42 @@ void gpt2_backward(GPT2 *model) {
   // This ensures both GPUs have the complete gradients for all parameters
   int num_pes = nvshmem_n_pes();
   if (num_pes > 1) {
-    // Allocate temporary buffer for allreduce operation
+    // Allocate symmetric buffer for gradient exchange (one-time allocation)
+    static float *symmetric_grad_buffer = NULL;
     static float *temp_grads = NULL;
-    if (temp_grads == NULL) {
+
+    if (symmetric_grad_buffer == NULL) {
+      // Allocate symmetric memory for gradient exchange
+      symmetric_grad_buffer =
+          (float *)nvshmem_malloc(model->num_parameters * sizeof(float));
+      if (symmetric_grad_buffer == NULL) {
+        printf("[PE %d] Error: Failed to allocate symmetric gradient buffer\n",
+               my_pe);
+        exit(EXIT_FAILURE);
+      }
+
+      // Also allocate temp buffer for summing
       cudaCheck(cudaMalloc((void **)&temp_grads,
                            model->num_parameters * sizeof(float)));
     }
 
-    // Simpler approach: GPU 0 gathers all gradients, sums them, and broadcasts
-    // back
     if (my_pe == 0) {
       // Copy our own gradients to temp buffer
       cudaCheck(cudaMemcpy(temp_grads, model->grads_memory,
                            model->num_parameters * sizeof(float),
                            cudaMemcpyDeviceToDevice));
 
-      // Get gradients from GPU 1 into grads_memory (overwrites GPU 0's
-      // gradients temporarily)
-      nvshmem_getmem(model->grads_memory, model->grads_memory,
+      // Copy our gradients to symmetric buffer first
+      cudaCheck(cudaMemcpy(symmetric_grad_buffer, model->grads_memory,
+                           model->num_parameters * sizeof(float),
+                           cudaMemcpyDeviceToDevice));
+      cudaCheck(cudaDeviceSynchronize());
+
+      // Wait for GPU 1 to copy its gradients to its symmetric buffer
+      nvshmem_barrier_all();
+
+      // Get GPU 1's gradients from its symmetric buffer
+      nvshmem_getmem(model->grads_memory, symmetric_grad_buffer,
                      model->num_parameters * sizeof(float), 1);
       nvshmem_quiet();
 
@@ -1818,18 +1836,37 @@ void gpt2_backward(GPT2 *model) {
       cudaCheck(cudaGetLastError());
       cudaCheck(cudaDeviceSynchronize());
 
-      // Now grads_memory on GPU 0 has the sum of all gradients
-      // Broadcast summed gradients back to GPU 1
-      nvshmem_putmem(model->grads_memory, model->grads_memory,
+      // Copy summed gradients to our symmetric buffer
+      cudaCheck(cudaMemcpy(symmetric_grad_buffer, model->grads_memory,
+                           model->num_parameters * sizeof(float),
+                           cudaMemcpyDeviceToDevice));
+      cudaCheck(cudaDeviceSynchronize());
+
+      // Broadcast summed gradients to GPU 1's symmetric buffer
+      nvshmem_putmem(symmetric_grad_buffer, symmetric_grad_buffer,
                      model->num_parameters * sizeof(float), 1);
       nvshmem_quiet();
     } else if (my_pe == 1) {
-      // GPU 1: Wait for GPU 0 to fetch our gradients and send back the sum
-      // GPU 0 will getmem our gradients, sum them, then putmem the result
-      // We just wait for the barrier
+      // Copy our gradients to symmetric buffer so GPU 0 can fetch them
+      cudaCheck(cudaMemcpy(symmetric_grad_buffer, model->grads_memory,
+                           model->num_parameters * sizeof(float),
+                           cudaMemcpyDeviceToDevice));
+      cudaCheck(cudaDeviceSynchronize());
+
+      // Signal that we're ready
+      nvshmem_barrier_all();
+
+      // Wait for GPU 0 to send back the summed gradients
+      // (GPU 0 will putmem into our symmetric buffer)
     }
 
-    nvshmem_barrier_all(); // Ensure gradient synchronization is complete
+    nvshmem_barrier_all(); // Ensure gradient exchange is complete
+
+    // Both GPUs: copy from symmetric buffer back to grads_memory
+    cudaCheck(cudaMemcpy(model->grads_memory, symmetric_grad_buffer,
+                         model->num_parameters * sizeof(float),
+                         cudaMemcpyDeviceToDevice));
+    cudaCheck(cudaDeviceSynchronize());
   }
 }
 
