@@ -1533,6 +1533,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
 
   // Synchronize before returning
   nvshmem_barrier_all();
+
+  // Broadcast the loss from Rank 1 to Rank 0 so Rank 0 can print it
+  // We use MPI for this small scalar broadcast as it's convenient
+  if (targets != NULL) {
+    MPI_Bcast(&model->mean_loss, 1, MPI_FLOAT, 1, MPI_COMM_WORLD);
+  }
 }
 
 void gpt2_zero_grad(GPT2 *model) {
@@ -2126,8 +2132,10 @@ int main(int argc, char *argv[]) {
         val_loss += model.mean_loss;
       }
       val_loss /= val_num_batches;
-      printf("val loss %f\n", val_loss);
-      logger_log_val(&logger, step, val_loss);
+      if (my_pe == 0) {
+        printf("val loss %f\n", val_loss);
+        logger_log_val(&logger, step, val_loss);
+      }
     }
 
     // once in a while do model inference to print generated text
@@ -2137,40 +2145,60 @@ int main(int argc, char *argv[]) {
         gen_tokens[i] = GPT2_EOT;
       }
       // now sample from the model autoregressively
-      printf("generating:\n---\n");
+      // now sample from the model autoregressively
+      if (my_pe == 0) {
+        printf("generating:\n---\n");
+      }
+
       for (int t = 1; t < genT; t++) {
         // note that inference is very wasteful here because for each token
         // we re-calculate the forward pass for all of (B,T) positions from
         // scratch but the inference here is just for sanity checking anyway
         // and we can maybe optimize a bit more later, with careful tests
         gpt2_forward(&model, gen_tokens, NULL, B, T);
-        // furthermore, below we're only using b=0 (i.e. the first row) of all
-        // B rows we're in principle running B "inference streams" in parallel
-        // here only using position 0 because it's a bit faster (copy less
-        // probs from GPU -> CPU) get the V-dimensional vector probs[0, t-1,
-        // :]
-        float *logits =
-            model.acts.output + (t - 1) * model.config.padded_vocab_size;
-        // move probs back to CPU and sample (note we only move the first
-        // vocab_size logits, ignoring the padding)
-        cudaCheck(cudaMemcpy(cpu_logits, logits,
-                             model.config.vocab_size * sizeof(float),
-                             cudaMemcpyDeviceToHost));
-        float coin = random_f32(&rng_state);
-        int next_token =
-            sample_softmax(cpu_logits, model.config.vocab_size, coin);
-        gen_tokens[t] = next_token;
-        // print the generated token, either using the Tokenizer or a fallback
-        if (tokenizer.init_ok) {
-          const char *token_str = tokenizer_decode(&tokenizer, next_token);
-          safe_printf(token_str);
-        } else {
-          // fall back to printing the token id
-          printf("%d ", next_token);
+
+        // Only Rank 1 has the logits and can sample
+        int next_token = 0;
+        if (my_pe == 1) {
+          // furthermore, below we're only using b=0 (i.e. the first row) of all
+          // B rows we're in principle running B "inference streams" in parallel
+          // here only using position 0 because it's a bit faster (copy less
+          // probs from GPU -> CPU) get the V-dimensional vector probs[0, t-1,
+          // :]
+          float *logits =
+              model.acts.output + (t - 1) * model.config.padded_vocab_size;
+          // move probs back to CPU and sample (note we only move the first
+          // vocab_size logits, ignoring the padding)
+          cudaCheck(cudaMemcpy(cpu_logits, logits,
+                               model.config.vocab_size * sizeof(float),
+                               cudaMemcpyDeviceToHost));
+          float coin = random_f32(&rng_state);
+          next_token =
+              sample_softmax(cpu_logits, model.config.vocab_size, coin);
         }
-        fflush(stdout);
+
+        // Broadcast the sampled token from Rank 1 to Rank 0
+        MPI_Bcast(&next_token, 1, MPI_INT, 1, MPI_COMM_WORLD);
+
+        // Both ranks need to update the input for the next step
+        gen_tokens[t] = next_token;
+
+        // Only Rank 0 prints
+        if (my_pe == 0) {
+          // print the generated token, either using the Tokenizer or a fallback
+          if (tokenizer.init_ok) {
+            const char *token_str = tokenizer_decode(&tokenizer, next_token);
+            safe_printf(token_str);
+          } else {
+            // fall back to printing the token id
+            printf("%d ", next_token);
+          }
+          fflush(stdout);
+        }
       }
-      printf("\n---\n");
+      if (my_pe == 0) {
+        printf("\n---\n");
+      }
     }
 
     // bit confusing: we want to make sure to eval and sample on 0th iteration
@@ -2196,10 +2224,12 @@ int main(int argc, char *argv[]) {
         (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     total_sum_iteration_time_s += time_elapsed_s;
     int tokens_per_second = (B * T) / time_elapsed_s;
-    printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1,
-           train_num_batches, model.mean_loss, time_elapsed_s * 1000,
-           tokens_per_second);
-    logger_log_train(&logger, step, model.mean_loss);
+    if (my_pe == 0) {
+      printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1,
+             train_num_batches, model.mean_loss, time_elapsed_s * 1000,
+             tokens_per_second);
+      logger_log_train(&logger, step, model.mean_loss);
+    }
   }
   // add a total average, for optimizations that are only mild improvements
   printf("total average iteration time: %f ms\n",
