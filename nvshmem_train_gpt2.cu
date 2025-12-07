@@ -1435,6 +1435,15 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     nvshmem_putmem(model->nvshmem_act_buffer, layer5_output,
                    B * T * C * sizeof(float), 1); // PE 1
     nvshmem_quiet();
+
+    // GPU 0 doesn't compute loss, but needs to set mean_loss for backward pass
+    // If targets provided, set to a valid value (GPU 1 has the actual loss)
+    // If no targets (inference), set to -1.0
+    if (targets != NULL) {
+      model->mean_loss = 0.0f; // Valid placeholder for backward check
+    } else {
+      model->mean_loss = -1.0f; // No targets, inference mode
+    }
   }
 
   // GPU 1: Layers 6-11 + Final LayerNorm + Loss
@@ -1660,6 +1669,68 @@ void gpt2_backward(GPT2 *model) {
       matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty,
                       l_attprojw, B, T, C, C);
       attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a,
+                         dl_btc, l_qkvr, l_att, B, T, C, NH);
+      matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C,
+                      3 * C);
+      layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w,
+                         l_ln1_mean, l_ln1_rstd, B, T, C);
+    }
+
+    // Transfer gradients to GPU 0 using nvshmem_putmem
+    nvshmem_putmem(model->nvshmem_grad_buffer, dresidual,
+                   B * T * C * sizeof(float), 0); // PE 0
+    nvshmem_quiet();
+  }
+
+  // GPU 0: Backward through layers 5-0 + Embedding
+  else if (my_pe == 0) {
+    // Wait for GPU 1 to send gradients
+    nvshmem_barrier_all();
+
+    // Copy received gradients from GPU 1's symmetric buffer
+    nvshmem_getmem(dresidual, model->nvshmem_grad_buffer,
+                   B * T * C * sizeof(float), 1); // From PE 1
+
+    // Backward through layers 5-0
+    for (int l = 5; l >= 0; l--) {
+      residual = (l == 0) ? acts.encoded : acts.residual3 + (l - 1) * B * T * C;
+
+      // Get weight pointers
+      float *l_ln1w = params.ln1w + l * C;
+      float *l_qkvw = params.qkvw + l * 3 * C * C;
+      float *l_attprojw = params.attprojw + l * C * C;
+      float *l_ln2w = params.ln2w + l * C;
+      float *l_fcw = params.fcw + l * 4 * C * C;
+      float *l_fcprojw = params.fcprojw + l * C * 4 * C;
+
+      // Get gradient pointers
+      float *dl_ln1w = grads.ln1w + l * C;
+      float *dl_ln1b = grads.ln1b + l * C;
+      float *dl_qkvw = grads.qkvw + l * 3 * C * C;
+      float *dl_qkvb = grads.qkvb + l * 3 * C;
+      float *dl_attprojw = grads.attprojw + l * C * C;
+      float *dl_attprojb = grads.attprojb + l * C;
+      float *dl_ln2w = grads.ln2w + l * C;
+      float *dl_ln2b = grads.ln2b + l * C;
+      float *dl_fcw = grads.fcw + l * 4 * C * C;
+      float *dl_fcb = grads.fcb + l * 4 * C;
+      float *dl_fcprojw = grads.fcprojw + l * C * 4 * C;
+      float *dl_fcprojb = grads.fcprojb + l * C;
+
+      // Get activation pointers
+      float *l_ln1 = acts.ln1 + l * B * T * C;
+      float *l_ln1_mean = acts.ln1_mean + l * B * T;
+      float *l_ln1_rstd = acts.ln1_rstd + l * B * T;
+      float *l_qkvr = acts.qkvr + l * B * T * 3 * C;
+      float *l_atty = acts.atty + l * B * T * C;
+      float *l_att = acts.att + l * B * NH * T * T;
+      float *l_residual2 = acts.residual2 + l * B * T * C;
+      float *l_ln2 = acts.ln2 + l * B * T * C;
+      float *l_ln2_mean = acts.ln2_mean + l * B * T;
+      float *l_ln2_rstd = acts.ln2_rstd + l * B * T;
+      float *l_fch = acts.fch + l * B * T * 4 * C;
+      float *l_fch_gelu = acts.fch_gelu + l * B * T * 4 * C;
+
       // Get gradient activation buffers
       float *dl_btc = acts.lnf;
       float *dl_bt4c = grads_acts.bt4c;
@@ -1684,566 +1755,487 @@ void gpt2_backward(GPT2 *model) {
                       3 * C);
       layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w,
                          l_ln1_mean, l_ln1_rstd, B, T, C);
-    
-    // Transfer gradients to GPU 0 using nvshmem_putmem
-    nvshmem_putmem(model->nvshmem_grad_buffer, dresidual,
-                   B * T * C * sizeof(float), 0);  // PE 0
-    nvshmem_quiet();
     }
 
-    // GPU 0: Backward through layers 5-0 + Embedding
-    else if (my_pe == 0) {
-      // Wait for GPU 1 to send gradients
-      nvshmem_barrier_all();
-
-      // Copy received gradients from GPU 1's symmetric buffer
-      nvshmem_getmem(dresidual, model->nvshmem_grad_buffer,
-                     B * T * C * sizeof(float), 1); // From PE 1
-
-      // Backward through layers 5-0
-      for (int l = 5; l >= 0; l--) {
-        residual =
-            (l == 0) ? acts.encoded : acts.residual3 + (l - 1) * B * T * C;
-
-        // Get weight pointers
-        float *l_ln1w = params.ln1w + l * C;
-        float *l_qkvw = params.qkvw + l * 3 * C * C;
-        float *l_attprojw = params.attprojw + l * C * C;
-        float *l_ln2w = params.ln2w + l * C;
-        float *l_fcw = params.fcw + l * 4 * C * C;
-        float *l_fcprojw = params.fcprojw + l * C * 4 * C;
-
-        // Get gradient pointers
-        float *dl_ln1w = grads.ln1w + l * C;
-        float *dl_ln1b = grads.ln1b + l * C;
-        float *dl_qkvw = grads.qkvw + l * 3 * C * C;
-        float *dl_qkvb = grads.qkvb + l * 3 * C;
-        float *dl_attprojw = grads.attprojw + l * C * C;
-        float *dl_attprojb = grads.attprojb + l * C;
-        float *dl_ln2w = grads.ln2w + l * C;
-        float *dl_ln2b = grads.ln2b + l * C;
-        float *dl_fcw = grads.fcw + l * 4 * C * C;
-        float *dl_fcb = grads.fcb + l * 4 * C;
-        float *dl_fcprojw = grads.fcprojw + l * C * 4 * C;
-        float *dl_fcprojb = grads.fcprojb + l * C;
-
-        // Get activation pointers
-        float *l_ln1 = acts.ln1 + l * B * T * C;
-        float *l_ln1_mean = acts.ln1_mean + l * B * T;
-        float *l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float *l_qkvr = acts.qkvr + l * B * T * 3 * C;
-        float *l_atty = acts.atty + l * B * T * C;
-        float *l_att = acts.att + l * B * NH * T * T;
-        float *l_residual2 = acts.residual2 + l * B * T * C;
-        float *l_ln2 = acts.ln2 + l * B * T * C;
-        float *l_ln2_mean = acts.ln2_mean + l * B * T;
-        float *l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        float *l_fch = acts.fch + l * B * T * 4 * C;
-        float *l_fch_gelu = acts.fch_gelu + l * B * T * 4 * C;
-
-        // Get gradient activation buffers
-        float *dl_btc = acts.lnf;
-        float *dl_bt4c = grads_acts.bt4c;
-        float *dl_preatt = grads_acts.preatt;
-        float *scratch = acts.output;
-        float *buffer_a = l_atty;
-        float *buffer_b = l_fch;
-
-        // Backward through this layer
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu,
-                        l_fcprojw, B, T, 4 * C, C);
-        gelu_backward(dl_bt4c, l_fch, dl_bt4c, B * T * 4 * C);
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C,
-                        4 * C);
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2,
-                           l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty,
-                        l_attprojw, B, T, C, C);
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a,
-                           dl_btc, l_qkvr, l_att, B, T, C, NH);
-        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T,
-                        C, 3 * C);
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual,
-                           l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
-      }
-
-      // Backward through embedding
-      encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
-    }
-
-    // Synchronize before returning
-    nvshmem_barrier_all();
-
-    // All-reduce wte gradients across all PEs using NCCL
-    // Both GPUs compute partial gradients for wte:
-    // - GPU 1 computes grads.wte during classifier backward (line 1606)
-    // - GPU 0 computes grads.wte during encoder backward (line 1761)
-    // We need to sum and average these gradients across GPUs
-    // Note: wpe, lnfw, and lnfb are only computed on one GPU each, so they
-    // don't need all-reduce
-    int n_pes = nvshmem_n_pes();
-
-    // All-reduce wte gradients: sum across all PEs using NCCL, then average
-    // ncclAllReduce with ncclAvg automatically averages, so we don't need to
-    // scale
-    ncclCheck(ncclAllReduce((const void *)grads.wte, (void *)grads.wte, Vp * C,
-                            ncclFloat, ncclAvg, model->nccl_comm, 0));
-
-    nvshmem_barrier_all();
+    // Backward through embedding
+    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
   }
 
-  void gpt2_update(GPT2 * model, float learning_rate, float beta1, float beta2,
-                   float eps, float weight_decay, int t) {
-    // reference:
-    // https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
+  // Synchronize before returning
+  nvshmem_barrier_all();
 
-    // lazily allocate the memory for m_memory and v_memory
-    if (model->m_memory == NULL) {
-      cudaCheck(cudaMalloc((void **)&model->m_memory,
-                           model->num_parameters * sizeof(float)));
-      cudaCheck(cudaMalloc((void **)&model->v_memory,
-                           model->num_parameters * sizeof(float)));
-      cudaCheck(cudaMemset(model->m_memory, 0,
-                           model->num_parameters * sizeof(float)));
-      cudaCheck(cudaMemset(model->v_memory, 0,
-                           model->num_parameters * sizeof(float)));
-      printf("allocated %zu MiB for AdamW optimizer state m\n",
-             (model->num_parameters * sizeof(float)) >> 20);
-      printf("allocated %zu MiB for AdamW optimizer state v\n",
-             (model->num_parameters * sizeof(float)) >> 20);
-    }
+  // All-reduce wte gradients across all PEs using NCCL
+  // Both GPUs compute partial gradients for wte:
+  // - GPU 1 computes grads.wte during classifier backward (line 1606)
+  // - GPU 0 computes grads.wte during encoder backward (line 1761)
+  // We need to sum and average these gradients across GPUs
+  // Note: wpe, lnfw, and lnfb are only computed on one GPU each, so they don't
+  // need all-reduce
+  int n_pes = nvshmem_n_pes();
 
-    int block_size = 512;
-    int num_blocks = CEIL_DIV(model->num_parameters, block_size);
-    float beta1_correction = 1.0f - powf(beta1, t);
-    float beta2_correction = 1.0f - powf(beta2, t);
-    adamw_kernel2<<<num_blocks, block_size>>>(
-        model->params_memory, model->grads_memory, model->m_memory,
-        model->v_memory, model->num_parameters, learning_rate, beta1, beta2,
-        beta1_correction, beta2_correction, eps, weight_decay);
-    cudaCheck(cudaGetLastError());
+  // All-reduce wte gradients: sum across all PEs using NCCL, then average
+  // ncclAllReduce with ncclAvg automatically averages, so we don't need to
+  // scale
+  ncclCheck(ncclAllReduce((const void *)grads.wte, (void *)grads.wte, Vp * C,
+                          ncclFloat, ncclAvg, model->nccl_comm, 0));
+
+  nvshmem_barrier_all();
+}
+
+void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
+                 float eps, float weight_decay, int t) {
+  // reference:
+  // https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
+
+  // lazily allocate the memory for m_memory and v_memory
+  if (model->m_memory == NULL) {
+    cudaCheck(cudaMalloc((void **)&model->m_memory,
+                         model->num_parameters * sizeof(float)));
+    cudaCheck(cudaMalloc((void **)&model->v_memory,
+                         model->num_parameters * sizeof(float)));
+    cudaCheck(
+        cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
+    cudaCheck(
+        cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
+    printf("allocated %zu MiB for AdamW optimizer state m\n",
+           (model->num_parameters * sizeof(float)) >> 20);
+    printf("allocated %zu MiB for AdamW optimizer state v\n",
+           (model->num_parameters * sizeof(float)) >> 20);
   }
 
-  void gpt2_free(GPT2 * model) {
-    cudaCheck(cudaFree(model->params_memory));
-    cudaCheck(cudaFree(model->grads_memory));
-    cudaCheck(cudaFree(model->m_memory));
-    cudaCheck(cudaFree(model->v_memory));
-    cudaCheck(cudaFree(model->acts_memory));
-    cudaCheck(cudaFree(model->grads_acts_memory));
-    cudaCheck(cudaFree(model->inputs));
-    cudaCheck(cudaFree(model->targets));
-    cudaFreeHost(model->cpu_losses);
-  }
+  int block_size = 512;
+  int num_blocks = CEIL_DIV(model->num_parameters, block_size);
+  float beta1_correction = 1.0f - powf(beta1, t);
+  float beta2_correction = 1.0f - powf(beta2, t);
+  adamw_kernel2<<<num_blocks, block_size>>>(
+      model->params_memory, model->grads_memory, model->m_memory,
+      model->v_memory, model->num_parameters, learning_rate, beta1, beta2,
+      beta1_correction, beta2_correction, eps, weight_decay);
+  cudaCheck(cudaGetLastError());
+}
+
+void gpt2_free(GPT2 *model) {
+  cudaCheck(cudaFree(model->params_memory));
+  cudaCheck(cudaFree(model->grads_memory));
+  cudaCheck(cudaFree(model->m_memory));
+  cudaCheck(cudaFree(model->v_memory));
+  cudaCheck(cudaFree(model->acts_memory));
+  cudaCheck(cudaFree(model->grads_acts_memory));
+  cudaCheck(cudaFree(model->inputs));
+  cudaCheck(cudaFree(model->targets));
+  cudaFreeHost(model->cpu_losses);
+}
 
 #ifndef TESTING
-  // if we are TESTING (see test_gpt2.cu), we'll skip the int main below
-  // ----------------------------------------------------------------------------
-  // sampler: takes probabilities and samples integers from them
+// if we are TESTING (see test_gpt2.cu), we'll skip the int main below
+// ----------------------------------------------------------------------------
+// sampler: takes probabilities and samples integers from them
 
 #define GPT2_EOT 50256
 
-  unsigned int random_u32(unsigned long long *state) {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-    *state ^= *state >> 12;
-    *state ^= *state << 25;
-    *state ^= *state >> 27;
-    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+unsigned int random_u32(unsigned long long *state) {
+  // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+  *state ^= *state >> 12;
+  *state ^= *state << 25;
+  *state ^= *state >> 27;
+  return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+}
+float random_f32(unsigned long long *state) { // random float32 in [0,1)
+  return (random_u32(state) >> 8) / 16777216.0f;
+}
+
+int sample_softmax(const float *logits, int n, float coin) {
+  // sample index from logits (converted to probabilities using softmax)
+  // coin is a random number in [0, 1), usually from random_f32()
+  double norm = 0;
+  for (int i = 0; i < n; i++) {
+    norm += expf(logits[i]);
   }
-  float random_f32(unsigned long long *state) { // random float32 in [0,1)
-    return (random_u32(state) >> 8) / 16777216.0f;
-  }
-
-  int sample_softmax(const float *logits, int n, float coin) {
-    // sample index from logits (converted to probabilities using softmax)
-    // coin is a random number in [0, 1), usually from random_f32()
-    double norm = 0;
-    for (int i = 0; i < n; i++) {
-      norm += expf(logits[i]);
-    }
-    // instead of dividing all exp(logits), we can just multiply coin.
-    coin *= norm;
-    float cdf = 0.0f;
-    for (int i = 0; i < n; i++) {
-      cdf += expf(logits[i]);
-      if (coin < cdf) {
-        return i;
-      }
-    }
-    return n - 1; // in case of rounding errors
-  }
-
-  // ----------------------------------------------------------------------------
-  // Logger lite, will probably grow/change some over time
-
-  typedef struct {
-    FILE *logfile;
-    int flush_every; // every how many steps to flush the log
-  } Logger;
-
-  void logger_init(Logger * logger, const char *filename) {
-    logger->flush_every = 20;
-    logger->logfile = NULL;
-    if (filename != NULL) {
-      logger->logfile = fopenCheck(filename, "w");
+  // instead of dividing all exp(logits), we can just multiply coin.
+  coin *= norm;
+  float cdf = 0.0f;
+  for (int i = 0; i < n; i++) {
+    cdf += expf(logits[i]);
+    if (coin < cdf) {
+      return i;
     }
   }
+  return n - 1; // in case of rounding errors
+}
 
-  void logger_log_val(Logger * logger, int step, float val_loss) {
-    if (logger->logfile != NULL) {
-      fprintf(logger->logfile, "s:%d tel:%.4f\n", step, val_loss);
+// ----------------------------------------------------------------------------
+// Logger lite, will probably grow/change some over time
+
+typedef struct {
+  FILE *logfile;
+  int flush_every; // every how many steps to flush the log
+} Logger;
+
+void logger_init(Logger *logger, const char *filename) {
+  logger->flush_every = 20;
+  logger->logfile = NULL;
+  if (filename != NULL) {
+    logger->logfile = fopenCheck(filename, "w");
+  }
+}
+
+void logger_log_val(Logger *logger, int step, float val_loss) {
+  if (logger->logfile != NULL) {
+    fprintf(logger->logfile, "s:%d tel:%.4f\n", step, val_loss);
+  }
+}
+
+void logger_log_train(Logger *logger, int step, float train_loss) {
+  if (logger->logfile != NULL) {
+    fprintf(logger->logfile, "s:%d trl:%.4f\n", step, train_loss);
+    if (step % 10 == 0) {
+      fflush(logger->logfile);
     }
   }
+}
 
-  void logger_log_train(Logger * logger, int step, float train_loss) {
-    if (logger->logfile != NULL) {
-      fprintf(logger->logfile, "s:%d trl:%.4f\n", step, train_loss);
-      if (step % 10 == 0) {
-        fflush(logger->logfile);
-      }
-    }
+void logger_free(Logger *logger) {
+  if (logger->logfile != NULL) {
+    fclose(logger->logfile);
   }
+}
 
-  void logger_free(Logger * logger) {
-    if (logger->logfile != NULL) {
-      fclose(logger->logfile);
-    }
-  }
+// ----------------------------------------------------------------------------
+// CLI, poor man's argparse
 
-  // ----------------------------------------------------------------------------
-  // CLI, poor man's argparse
+void error_usage() {
+  fprintf(stderr, "Usage:   ./train_gpt2fp32cu [options]\n");
+  fprintf(stderr, "Options:\n");
+  fprintf(stderr, "  -i <string> train data filename pattern (default = "
+                  "dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+  fprintf(stderr, "  -j <string> val data filename pattern (default = "
+                  "dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
+  fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
+  fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
+  fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
+  fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
+  fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val "
+                  "loss (default = 20)\n");
+  fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to "
+                  "estimate val loss? (default = 20)\n");
+  fprintf(stderr, "  -s <int>    sample_every, how often we inference the "
+                  "model (default = 20)\n");
+  fprintf(stderr, "  -g <int>    genT, how many steps of inference we do "
+                  "(default = 64)\n");
+  exit(EXIT_FAILURE);
+}
 
-  void error_usage() {
-    fprintf(stderr, "Usage:   ./train_gpt2fp32cu [options]\n");
-    fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -i <string> train data filename pattern (default = "
-                    "dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
-    fprintf(stderr, "  -j <string> val data filename pattern (default = "
-                    "dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
-    fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
-    fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
-    fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
-    fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
-    fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val "
-                    "loss (default = 20)\n");
-    fprintf(stderr,
-            "  -m <int>    val_max_steps, up to how many val batches to "
-            "estimate val loss? (default = 20)\n");
-    fprintf(stderr, "  -s <int>    sample_every, how often we inference the "
-                    "model (default = 20)\n");
-    fprintf(stderr, "  -g <int>    genT, how many steps of inference we do "
-                    "(default = 64)\n");
-    exit(EXIT_FAILURE);
-  }
+// ----------------------------------------------------------------------------
+// main training loop
+int main(int argc, char *argv[]) {
 
-  // ----------------------------------------------------------------------------
-  // main training loop
-  int main(int argc, char *argv[]) {
+  // Initialize MPI
+  MPI_Init(&argc, &argv);
 
-    // Initialize MPI
-    MPI_Init(&argc, &argv);
+  // Initialize NVSHMEM
+  nvshmemx_init_attr_t attr;
+  MPI_Comm mpi_comm = MPI_COMM_WORLD;
+  attr.mpi_comm = &mpi_comm;
+  nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
 
-    // Initialize NVSHMEM
-    nvshmemx_init_attr_t attr;
-    MPI_Comm mpi_comm = MPI_COMM_WORLD;
-    attr.mpi_comm = &mpi_comm;
-    nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
+  // Get PE information (safe to call immediately after init_attr)
+  int my_pe = nvshmem_my_pe();
+  int n_pes = nvshmem_n_pes();
 
-    int my_pe = nvshmem_my_pe();
-    int n_pes = nvshmem_n_pes();
-
-    if (n_pes != 2) {
-      if (my_pe == 0) {
-        fprintf(stderr,
-                "Error: This pipeline implementation requires exactly 2 GPUs, "
-                "got %d\\n",
-                n_pes);
-      }
-      nvshmem_finalize();
-      MPI_Finalize();
-      return 1;
-    }
-
-    // Set GPU device based on PE
-    cudaCheck(cudaSetDevice(my_pe));
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, my_pe);
-
-    // read in the (optional) command line arguments
-    const char *train_data_pattern =
-        "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-    const char *val_data_pattern =
-        "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char *output_log_file = NULL;
-    int B = 4;    // batch size
-    int T = 1024; // sequence length max
-    float learning_rate = 3e-4f;
-    int val_loss_every = 20; // every how many steps do we eval validation loss?
-    int val_max_steps =
-        20; // how many batches max do we eval for validation loss?
-    int sample_every = 20; // every how many steps to do inference?
-    int genT = 64;         // number of steps of inference we will do
-    for (int i = 1; i < argc; i += 2) {
-      if (i + 1 >= argc) {
-        error_usage();
-      } // must have arg after flag
-      if (argv[i][0] != '-') {
-        error_usage();
-      } // must start with dash
-      if (strlen(argv[i]) != 2) {
-        error_usage();
-      } // must be -x (one dash, one letter)
-      // read in the args
-      if (argv[i][1] == 'i') {
-        train_data_pattern = argv[i + 1];
-      } else if (argv[i][1] == 'j') {
-        val_data_pattern = argv[i + 1];
-      } else if (argv[i][1] == 'o') {
-        output_log_file = argv[i + 1];
-      } else if (argv[i][1] == 'b') {
-        B = atoi(argv[i + 1]);
-      } else if (argv[i][1] == 't') {
-        T = atoi(argv[i + 1]);
-      } else if (argv[i][1] == 'l') {
-        learning_rate = atof(argv[i + 1]);
-      } else if (argv[i][1] == 'v') {
-        val_loss_every = atoi(argv[i + 1]);
-      } else if (argv[i][1] == 'm') {
-        val_max_steps = atoi(argv[i + 1]);
-      } else if (argv[i][1] == 's') {
-        sample_every = atoi(argv[i + 1]);
-      } else if (argv[i][1] == 'g') {
-        genT = atoi(argv[i + 1]);
-      } else {
-        error_usage();
-      }
-    }
-
+  if (n_pes != 2) {
     if (my_pe == 0) {
-      printf(
-          "+------------------------+-----------------------------------------"
-          "-----------+\\n");
-      printf(
-          "| Parameter              | Value                                   "
-          "           |\\n");
-      printf(
-          "+------------------------+-----------------------------------------"
-          "-----------+\\n");
-      printf("| NVSHMEM PEs (GPUs)     | %-50d |\\n", n_pes);
-      printf("| This PE                | %-50d |\\n", my_pe);
-      printf("| train data pattern     | %-50s |\\n", train_data_pattern);
-      printf("| val data pattern       | %-50s |\\n", val_data_pattern);
-      printf("| output log file        | %-50s |\\n",
-             output_log_file == NULL ? "NULL" : output_log_file);
-      printf("| batch size B           | %-50d |\\n", B);
-      printf("| sequence length T      | %-50d |\\n", T);
-      printf("| learning rate          | %-50f |\\n", learning_rate);
-      printf("| val_loss_every         | %-50d |\\n", val_loss_every);
-      printf("| val_max_steps          | %-50d |\\n", val_max_steps);
-      printf("| sample_every           | %-50d |\\n", sample_every);
-      printf("| genT                   | %-50d |\\n", genT);
-      printf(
-          "+------------------------+-----------------------------------------"
-          "-----------+\\n");
+      fprintf(stderr,
+              "Error: This pipeline implementation requires exactly 2 GPUs, "
+              "got %d\\n",
+              n_pes);
     }
-
-    // setup cuBLAS and cuBLASLt
-    cublasCheck(cublasCreate(&cublas_handle));
-    // TF32 precision is equivalent to
-    // torch.set_float32_matmul_precision('high')
-    int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
-    cublas_compute_type =
-        enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-    cublasMath_t cublas_math_mode =
-        enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
-    cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
-    if (my_pe == 0) {
-      printf("| device                 | %-50s |\\n", deviceProp.name);
-      printf("| TF32                   | %-50s |\\n",
-             enable_tf32 ? "enabled" : "disabled");
-      printf(
-          "+------------------------+-----------------------------------------"
-          "-----------+\\n");
-    }
-
-    // build the GPT-2 model from a checkpoint
-    GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
-    if (my_pe == 0) {
-      printf("| max_sequence_length T | %-50d |\\n", model.config.max_seq_len);
-      printf("| vocab_size V          | %-50d |\\n", model.config.vocab_size);
-      printf("| padded_vocab_size Vp  | %-50d |\\n",
-             model.config.padded_vocab_size);
-      printf("| num_layers L          | %-50d |\\n", model.config.num_layers);
-      printf("| num_heads NH          | %-50d |\\n", model.config.num_heads);
-      printf("| channels C            | %-50d |\\n", model.config.channels);
-      printf("| num_parameters        | %-50zu |\\n", model.num_parameters);
-      printf(
-          "+------------------------+-----------------------------------------"
-          "-----------+"
-          "\\n");
-    }
-
-    // build DataLoaders for both train and val
-    DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
-    dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
-    int train_num_batches = train_loader.num_tokens /
-                            (B * T); // let's do 1 epoch by default for now
-    int val_num_batches = val_loader.num_tokens / (B * T);
-    if (val_num_batches > val_max_steps) {
-      val_num_batches = val_max_steps;
-    }
-    if (my_pe == 0) {
-      printf("| train_num_batches     | %-50d |\\n", train_num_batches);
-      printf("| val_num_batches       | %-50d |\\n", val_num_batches);
-      printf(
-          "+------------------------+-----------------------------------------"
-          "-----------+"
-          "\\n");
-    }
-
-    // print model parameter allocations from gpt2_build_from_checkpoint down
-    // here to not mess up our table above
-    if (my_pe == 0) {
-      printf("allocated %d MiB for model parameters\\n",
-             (int)round(model.num_parameters * sizeof(float) / (1024 * 1024)));
-    }
-
-    // Do a dummy forward pass to allocate activations
-    int *dummy_batch = (int *)malloc(B * T * sizeof(int));
-    for (int i = 0; i < B * T; i++) {
-      dummy_batch[i] = 0;
-    }
-    gpt2_forward(&model, dummy_batch, NULL, B, T);
-    free(dummy_batch);
-
-    // Now allocate NVSHMEM buffers after we know batch size
-    gpt2_allocate_nvshmem_buffers(&model);
-
-    // set up the Logger
-    Logger logger;
-    logger_init(&logger, output_log_file);
-
-    // set up the Tokenizer
-    Tokenizer tokenizer;
-    tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
-
-    // some memory for generating samples from the model
-    unsigned long long rng_state = 1337;
-    int *gen_tokens = (int *)mallocCheck(B * T * sizeof(int));
-    float *cpu_logits =
-        (float *)mallocCheck(model.config.vocab_size * sizeof(float));
-
-    // train
-    struct timespec start, end;
-    double total_sum_iteration_time_s = 0.0;
-    for (int step = 0; step <= train_num_batches; step++) {
-      int last_step = step == train_num_batches;
-
-      // once in a while estimate the validation loss
-      if (step % val_loss_every == 0 || last_step) {
-        float val_loss = 0.0f;
-        dataloader_reset(&val_loader);
-        for (int i = 0; i < val_num_batches; i++) {
-          dataloader_next_batch(&val_loader);
-          gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
-          val_loss += model.mean_loss;
-        }
-        val_loss /= val_num_batches;
-        printf("val loss %f\n", val_loss);
-        logger_log_val(&logger, step, val_loss);
-      }
-
-      // once in a while do model inference to print generated text
-      if (step > 0 && step % sample_every == 0 || last_step) {
-        // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
-        for (int i = 0; i < B * T; ++i) {
-          gen_tokens[i] = GPT2_EOT;
-        }
-        // now sample from the model autoregressively
-        printf("generating:\n---\n");
-        for (int t = 1; t < genT; t++) {
-          // note that inference is very wasteful here because for each token
-          // we re-calculate the forward pass for all of (B,T) positions from
-          // scratch but the inference here is just for sanity checking anyway
-          // and we can maybe optimize a bit more later, with careful tests
-          gpt2_forward(&model, gen_tokens, NULL, B, T);
-          // furthermore, below we're only using b=0 (i.e. the first row) of all
-          // B rows we're in principle running B "inference streams" in parallel
-          // here only using position 0 because it's a bit faster (copy less
-          // probs from GPU -> CPU) get the V-dimensional vector probs[0, t-1,
-          // :]
-          float *logits =
-              model.acts.output + (t - 1) * model.config.padded_vocab_size;
-          // move probs back to CPU and sample (note we only move the first
-          // vocab_size logits, ignoring the padding)
-          cudaCheck(cudaMemcpy(cpu_logits, logits,
-                               model.config.vocab_size * sizeof(float),
-                               cudaMemcpyDeviceToHost));
-          float coin = random_f32(&rng_state);
-          int next_token =
-              sample_softmax(cpu_logits, model.config.vocab_size, coin);
-          gen_tokens[t] = next_token;
-          // print the generated token, either using the Tokenizer or a fallback
-          if (tokenizer.init_ok) {
-            const char *token_str = tokenizer_decode(&tokenizer, next_token);
-            safe_printf(token_str);
-          } else {
-            // fall back to printing the token id
-            printf("%d ", next_token);
-          }
-          fflush(stdout);
-        }
-        printf("\n---\n");
-      }
-
-      // bit confusing: we want to make sure to eval and sample on 0th iteration
-      // but also after the very last iteration. so we loop for step <=
-      // train_num_batches instead of just < train_num_batches (one extra due to
-      // <=), only to do the validation/sampling one last time, and then we
-      // break right here as we're done.
-      if (last_step) {
-        break;
-      }
-
-      // do a training step
-      clock_gettime(CLOCK_MONOTONIC, &start);
-      dataloader_next_batch(&train_loader);
-      gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-      gpt2_zero_grad(&model);
-      gpt2_backward(&model);
-      gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step + 1);
-      cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct
-                                          // precise timings
-      clock_gettime(CLOCK_MONOTONIC, &end);
-      double time_elapsed_s =
-          (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-      total_sum_iteration_time_s += time_elapsed_s;
-      int tokens_per_second = (B * T) / time_elapsed_s;
-      printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1,
-             train_num_batches, model.mean_loss, time_elapsed_s * 1000,
-             tokens_per_second);
-      logger_log_train(&logger, step, model.mean_loss);
-    }
-    // add a total average, for optimizations that are only mild improvements
-    printf("total average iteration time: %f ms\n",
-           total_sum_iteration_time_s / train_num_batches * 1000);
-
-    // free
-    dataloader_free(&train_loader);
-    dataloader_free(&val_loader);
-    tokenizer_free(&tokenizer);
-    gpt2_free(&model);
-    free(cpu_logits);
-    free(gen_tokens);
-    cublasCheck(cublasDestroy(cublas_handle));
-    logger_free(&logger);
-
-    // Finalize NVSHMEM and MPI
     nvshmem_finalize();
     MPI_Finalize();
-
-    return 0;
+    return 1;
   }
+
+  // CRITICAL: Set GPU device BEFORE barrier
+  // Each PE must have its CUDA context on the correct device
+  cudaCheck(cudaSetDevice(my_pe));
+  cudaDeviceProp deviceProp;
+  cudaGetDeviceProperties(&deviceProp, my_pe);
+
+  // Now synchronize - all PEs have their devices set
+  cudaDeviceSynchronize();
+  nvshmem_barrier_all();
+
+  // read in the (optional) command line arguments
+  const char *train_data_pattern =
+      "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+  const char *val_data_pattern =
+      "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
+  const char *output_log_file = NULL;
+  int B = 4;    // batch size
+  int T = 1024; // sequence length max
+  float learning_rate = 3e-4f;
+  int val_loss_every = 20; // every how many steps do we eval validation loss?
+  int val_max_steps =
+      20;                // how many batches max do we eval for validation loss?
+  int sample_every = 20; // every how many steps to do inference?
+  int genT = 64;         // number of steps of inference we will do
+  for (int i = 1; i < argc; i += 2) {
+    if (i + 1 >= argc) {
+      error_usage();
+    } // must have arg after flag
+    if (argv[i][0] != '-') {
+      error_usage();
+    } // must start with dash
+    if (strlen(argv[i]) != 2) {
+      error_usage();
+    } // must be -x (one dash, one letter)
+    // read in the args
+    if (argv[i][1] == 'i') {
+      train_data_pattern = argv[i + 1];
+    } else if (argv[i][1] == 'j') {
+      val_data_pattern = argv[i + 1];
+    } else if (argv[i][1] == 'o') {
+      output_log_file = argv[i + 1];
+    } else if (argv[i][1] == 'b') {
+      B = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 't') {
+      T = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 'l') {
+      learning_rate = atof(argv[i + 1]);
+    } else if (argv[i][1] == 'v') {
+      val_loss_every = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 'm') {
+      val_max_steps = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 's') {
+      sample_every = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 'g') {
+      genT = atoi(argv[i + 1]);
+    } else {
+      error_usage();
+    }
+  }
+
+  if (my_pe == 0) {
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\\n");
+    printf("| Parameter              | Value                                   "
+           "           |\\n");
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\\n");
+    printf("| NVSHMEM PEs (GPUs)     | %-50d |\\n", n_pes);
+    printf("| This PE                | %-50d |\\n", my_pe);
+    printf("| train data pattern     | %-50s |\\n", train_data_pattern);
+    printf("| val data pattern       | %-50s |\\n", val_data_pattern);
+    printf("| output log file        | %-50s |\\n",
+           output_log_file == NULL ? "NULL" : output_log_file);
+    printf("| batch size B           | %-50d |\\n", B);
+    printf("| sequence length T      | %-50d |\\n", T);
+    printf("| learning rate          | %-50f |\\n", learning_rate);
+    printf("| val_loss_every         | %-50d |\\n", val_loss_every);
+    printf("| val_max_steps          | %-50d |\\n", val_max_steps);
+    printf("| sample_every           | %-50d |\\n", sample_every);
+    printf("| genT                   | %-50d |\\n", genT);
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\\n");
+  }
+
+  // setup cuBLAS and cuBLASLt
+  cublasCheck(cublasCreate(&cublas_handle));
+  // TF32 precision is equivalent to
+  // torch.set_float32_matmul_precision('high')
+  int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+  cublas_compute_type =
+      enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+  cublasMath_t cublas_math_mode =
+      enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+  cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
+  if (my_pe == 0) {
+    printf("| device                 | %-50s |\\n", deviceProp.name);
+    printf("| TF32                   | %-50s |\\n",
+           enable_tf32 ? "enabled" : "disabled");
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\\n");
+  }
+
+  // build the GPT-2 model from a checkpoint
+  GPT2 model;
+  gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+  if (my_pe == 0) {
+    printf("| max_sequence_length T | %-50d |\\n", model.config.max_seq_len);
+    printf("| vocab_size V          | %-50d |\\n", model.config.vocab_size);
+    printf("| padded_vocab_size Vp  | %-50d |\\n",
+           model.config.padded_vocab_size);
+    printf("| num_layers L          | %-50d |\\n", model.config.num_layers);
+    printf("| num_heads NH          | %-50d |\\n", model.config.num_heads);
+    printf("| channels C            | %-50d |\\n", model.config.channels);
+    printf("| num_parameters        | %-50zu |\\n", model.num_parameters);
+    printf("+------------------------+-----------------------------------------"
+           "-----------+"
+           "\\n");
+  }
+
+  // build DataLoaders for both train and val
+  DataLoader train_loader, val_loader;
+  dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
+  dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
+  int train_num_batches =
+      train_loader.num_tokens / (B * T); // let's do 1 epoch by default for now
+  int val_num_batches = val_loader.num_tokens / (B * T);
+  if (val_num_batches > val_max_steps) {
+    val_num_batches = val_max_steps;
+  }
+  if (my_pe == 0) {
+    printf("| train_num_batches     | %-50d |\\n", train_num_batches);
+    printf("| val_num_batches       | %-50d |\\n", val_num_batches);
+    printf("+------------------------+-----------------------------------------"
+           "-----------+"
+           "\\n");
+  }
+
+  // print model parameter allocations from gpt2_build_from_checkpoint down
+  // here to not mess up our table above
+  if (my_pe == 0) {
+    printf("allocated %d MiB for model parameters\\n",
+           (int)round(model.num_parameters * sizeof(float) / (1024 * 1024)));
+  }
+
+  // Allocate NVSHMEM buffers BEFORE the first forward pass
+  // The forward pass will use nvshmem_putmem, so buffers must exist first
+  int C = model.config.channels;
+  model.batch_size = B;
+  model.seq_len = T;
+  gpt2_allocate_nvshmem_buffers(&model);
+
+  // Do a dummy forward pass to allocate activations
+  int *dummy_batch = (int *)malloc(B * T * sizeof(int));
+  for (int i = 0; i < B * T; i++) {
+    dummy_batch[i] = 0;
+  }
+  gpt2_forward(&model, dummy_batch, NULL, B, T);
+  free(dummy_batch);
+
+  // set up the Logger
+  Logger logger;
+  logger_init(&logger, output_log_file);
+
+  // set up the Tokenizer
+  Tokenizer tokenizer;
+  tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+
+  // some memory for generating samples from the model
+  unsigned long long rng_state = 1337;
+  int *gen_tokens = (int *)mallocCheck(B * T * sizeof(int));
+  float *cpu_logits =
+      (float *)mallocCheck(model.config.vocab_size * sizeof(float));
+
+  // train
+  struct timespec start, end;
+  double total_sum_iteration_time_s = 0.0;
+  for (int step = 0; step <= train_num_batches; step++) {
+    int last_step = step == train_num_batches;
+
+    // once in a while estimate the validation loss
+    if (step % val_loss_every == 0 || last_step) {
+      float val_loss = 0.0f;
+      dataloader_reset(&val_loader);
+      for (int i = 0; i < val_num_batches; i++) {
+        dataloader_next_batch(&val_loader);
+        gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+        val_loss += model.mean_loss;
+      }
+      val_loss /= val_num_batches;
+      printf("val loss %f\n", val_loss);
+      logger_log_val(&logger, step, val_loss);
+    }
+
+    // once in a while do model inference to print generated text
+    if (step > 0 && step % sample_every == 0 || last_step) {
+      // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
+      for (int i = 0; i < B * T; ++i) {
+        gen_tokens[i] = GPT2_EOT;
+      }
+      // now sample from the model autoregressively
+      printf("generating:\n---\n");
+      for (int t = 1; t < genT; t++) {
+        // note that inference is very wasteful here because for each token
+        // we re-calculate the forward pass for all of (B,T) positions from
+        // scratch but the inference here is just for sanity checking anyway
+        // and we can maybe optimize a bit more later, with careful tests
+        gpt2_forward(&model, gen_tokens, NULL, B, T);
+        // furthermore, below we're only using b=0 (i.e. the first row) of all
+        // B rows we're in principle running B "inference streams" in parallel
+        // here only using position 0 because it's a bit faster (copy less
+        // probs from GPU -> CPU) get the V-dimensional vector probs[0, t-1,
+        // :]
+        float *logits =
+            model.acts.output + (t - 1) * model.config.padded_vocab_size;
+        // move probs back to CPU and sample (note we only move the first
+        // vocab_size logits, ignoring the padding)
+        cudaCheck(cudaMemcpy(cpu_logits, logits,
+                             model.config.vocab_size * sizeof(float),
+                             cudaMemcpyDeviceToHost));
+        float coin = random_f32(&rng_state);
+        int next_token =
+            sample_softmax(cpu_logits, model.config.vocab_size, coin);
+        gen_tokens[t] = next_token;
+        // print the generated token, either using the Tokenizer or a fallback
+        if (tokenizer.init_ok) {
+          const char *token_str = tokenizer_decode(&tokenizer, next_token);
+          safe_printf(token_str);
+        } else {
+          // fall back to printing the token id
+          printf("%d ", next_token);
+        }
+        fflush(stdout);
+      }
+      printf("\n---\n");
+    }
+
+    // bit confusing: we want to make sure to eval and sample on 0th iteration
+    // but also after the very last iteration. so we loop for step <=
+    // train_num_batches instead of just < train_num_batches (one extra due to
+    // <=), only to do the validation/sampling one last time, and then we
+    // break right here as we're done.
+    if (last_step) {
+      break;
+    }
+
+    // do a training step
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    dataloader_next_batch(&train_loader);
+    gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+    gpt2_zero_grad(&model);
+    gpt2_backward(&model);
+    gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step + 1);
+    cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct
+                                        // precise timings
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double time_elapsed_s =
+        (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    total_sum_iteration_time_s += time_elapsed_s;
+    int tokens_per_second = (B * T) / time_elapsed_s;
+    printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1,
+           train_num_batches, model.mean_loss, time_elapsed_s * 1000,
+           tokens_per_second);
+    logger_log_train(&logger, step, model.mean_loss);
+  }
+  // add a total average, for optimizations that are only mild improvements
+  printf("total average iteration time: %f ms\n",
+         total_sum_iteration_time_s / train_num_batches * 1000);
+
+  // free
+  dataloader_free(&train_loader);
+  dataloader_free(&val_loader);
+  tokenizer_free(&tokenizer);
+  gpt2_free(&model);
+  free(cpu_logits);
+  free(gen_tokens);
+  cublasCheck(cublasDestroy(cublas_handle));
+  logger_free(&logger);
+
+  // Finalize NVSHMEM and MPI
+  nvshmem_finalize();
+  MPI_Finalize();
+
+  return 0;
+}
 #endif
