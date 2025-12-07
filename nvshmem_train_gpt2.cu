@@ -1912,12 +1912,7 @@ int main(int argc, char *argv[]) {
   attr.mpi_comm = &mpi_comm;
   nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
 
-  // CRITICAL: Wait for NVSHMEM initialization to complete on all PEs
-  // before making any NVSHMEM API calls (including nvshmem_my_pe,
-  // nvshmem_malloc, etc.)
-  cudaDeviceSynchronize();
-  nvshmem_barrier_all();
-
+  // Get PE information (safe to call immediately after init_attr)
   int my_pe = nvshmem_my_pe();
   int n_pes = nvshmem_n_pes();
 
@@ -1933,10 +1928,15 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Set GPU device based on PE
+  // CRITICAL: Set GPU device BEFORE barrier
+  // Each PE must have its CUDA context on the correct device
   cudaCheck(cudaSetDevice(my_pe));
   cudaDeviceProp deviceProp;
   cudaGetDeviceProperties(&deviceProp, my_pe);
+
+  // Now synchronize - all PEs have their devices set
+  cudaDeviceSynchronize();
+  nvshmem_barrier_all();
 
   // read in the (optional) command line arguments
   const char *train_data_pattern =
