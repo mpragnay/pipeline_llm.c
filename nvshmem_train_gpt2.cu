@@ -1435,6 +1435,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     nvshmem_putmem(model->nvshmem_act_buffer, layer5_output,
                    B * T * C * sizeof(float), 1); // PE 1
     nvshmem_quiet();
+    nvshmem_barrier_all(); // Signal to PE 1 that data is ready
 
     // GPU 0 doesn't compute loss, but needs to set mean_loss for backward pass
     // If targets provided, set to a valid value (GPU 1 has the actual loss)
@@ -1686,6 +1687,7 @@ void gpt2_backward(GPT2 *model) {
     nvshmem_putmem(model->nvshmem_grad_buffer, dresidual,
                    B * T * C * sizeof(float), 0); // PE 0
     nvshmem_quiet();
+    nvshmem_barrier_all(); // Signal to PE 0 that gradients are ready
   }
 
   // GPU 0: Backward through layers 5-0 + Embedding
