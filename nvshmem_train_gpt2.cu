@@ -1773,6 +1773,23 @@ void gpt2_backward(GPT2 *model) {
 
     // Synchronize before returning
     nvshmem_barrier_all();
+
+    // All-reduce wte gradients across all PEs using NCCL
+    // Both GPUs compute partial gradients for wte:
+    // - GPU 1 computes grads.wte during classifier backward (line 1606)
+    // - GPU 0 computes grads.wte during encoder backward (line 1761)
+    // We need to sum and average these gradients across GPUs
+    // Note: wpe, lnfw, and lnfb are only computed on one GPU each, so they
+    // don't need all-reduce
+    int n_pes = nvshmem_n_pes();
+
+    // All-reduce wte gradients: sum across all PEs using NCCL, then average
+    // ncclAllReduce with ncclAvg automatically averages, so we don't need to
+    // scale
+    ncclCheck(ncclAllReduce((const void *)grads.wte, (void *)grads.wte, Vp * C,
+                            ncclFloat, ncclAvg, model->nccl_comm, 0));
+
+    nvshmem_barrier_all();
   }
 
   void gpt2_update(GPT2 * model, float learning_rate, float beta1, float beta2,
