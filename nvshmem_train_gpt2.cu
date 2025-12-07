@@ -1371,6 +1371,67 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
   ActivationTensors acts = model->acts;
   float *residual;
 
+  // During dummy forward (NVSHMEM buffers not allocated yet), run full model sequentially
+  // This is needed to allocate activations properly on each PE
+  if (model->nvshmem_act_buffer == NULL) {
+    // Encoder
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
+    
+    // All layers
+    for (int l = 0; l < L; l++) {
+      residual = (l == 0) ? acts.encoded : acts.residual3 + (l - 1) * B * T * C;
+
+      float *l_ln1w = params.ln1w + l * C;
+      float *l_ln1b = params.ln1b + l * C;
+      float *l_qkvw = params.qkvw + l * 3 * C * C;
+      float *l_qkvb = params.qkvb + l * 3 * C;
+      float *l_attprojw = params.attprojw + l * C * C;
+      float *l_attprojb = params.attprojb + l * C;
+      float *l_ln2w = params.ln2w + l * C;
+      float *l_ln2b = params.ln2b + l * C;
+      float *l_fcw = params.fcw + l * 4 * C * C;
+      float *l_fcb = params.fcb + l * 4 * C;
+      float *l_fcprojw = params.fcprojw + l * C * 4 * C;
+      float *l_fcprojb = params.fcprojb + l * C;
+
+      float *l_ln1 = acts.ln1 + l * B * T * C;
+      float *l_ln1_mean = acts.ln1_mean + l * B * T;
+      float *l_ln1_rstd = acts.ln1_rstd + l * B * T;
+      float *l_qkvr = acts.qkvr + l * B * T * 3 * C;
+      float *l_atty = acts.atty + l * B * T * C;
+      float *l_att = acts.att + l * B * NH * T * T;
+      float *l_attproj = acts.attproj + l * B * T * C;
+      float *l_residual2 = acts.residual2 + l * B * T * C;
+      float *l_ln2 = acts.ln2 + l * B * T * C;
+      float *l_ln2_mean = acts.ln2_mean + l * B * T;
+      float *l_ln2_rstd = acts.ln2_rstd + l * B * T;
+      float *l_fch = acts.fch + l * B * T * 4 * C;
+      float *l_fch_gelu = acts.fch_gelu + l * B * T * 4 * C;
+      float *l_fcproj = acts.fcproj + l * B * T * C;
+      float *l_residual3 = acts.residual3 + l * B * T * C;
+      float *scratch = acts.output;
+
+      layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+      matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3 * C);
+      attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
+      matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+      residual_forward(l_residual2, residual, l_attproj, B * T * C);
+      layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+      matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4 * C);
+      gelu_forward(l_fch_gelu, l_fch, B * T * 4 * C);
+      matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4 * C, C);
+      residual_forward(l_residual3, l_residual2, l_fcproj, B * T * C);
+    }
+
+    // Final layernorm and output
+    residual = acts.residual3 + (L - 1) * B * T * C;
+    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
+    matmul_forward(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    
+    model->mean_loss = -1.0f;  // No loss computed for dummy forward
+    return;  // Early return for dummy forward
+  }
+
   // GPU 0: Embedding + Layers 0-5
   if (my_pe == 0) {
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T,
@@ -1428,26 +1489,37 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
       residual_forward(l_residual3, l_residual2, l_fcproj, B * T * C);
     }
 
-    // Copy layer 5 output to symmetric buffer
+    // Copy layer 5 output to symmetric buffer using nvshmem_putmem_nbi (non-blocking)
+    // We put from local CUDA memory directly to remote PE's symmetric buffer
     float *layer5_output = acts.residual3 + 5 * B * T * C;
-    cudaCheck(cudaMemcpy(model->nvshmem_act_buffer, layer5_output,
-                         B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
-
-    // Transfer to GPU 1
-    nvshmem_float_put(model->nvshmem_act_buffer, model->nvshmem_act_buffer,
-                      B * T * C, 1); // PE 1
-    nvshmem_quiet();
+    
+    // Only do NVSHMEM transfer if buffers are allocated (skip during dummy forward)
+    if (model->nvshmem_act_buffer != NULL) {
+      // First copy to local symmetric buffer
+      cudaDeviceSynchronize();  // Ensure layer 5 computation is complete
+      
+      // Use nvshmem_putmem to transfer directly to PE 1's symmetric buffer
+      // Source is local device memory, destination is PE 1's symmetric buffer
+      nvshmem_float_put(model->nvshmem_act_buffer, layer5_output, B * T * C, 1);
+      nvshmem_quiet();  // Ensure transfer completes
+      
+      MPI_Barrier(MPI_COMM_WORLD);  // Sync with PE 1
+    }
   }
 
   // GPU 1: Layers 6-11 + Final LayerNorm + Loss
   else if (my_pe == 1) {
-    // Wait for GPU 0 to complete transfer
-    nvshmem_barrier_all();
+    // Only do NVSHMEM transfer if buffers are allocated (skip during dummy forward)
+    if (model->nvshmem_act_buffer != NULL) {
+      // Wait for GPU 0 to complete transfer
+      MPI_Barrier(MPI_COMM_WORLD);  // Use MPI barrier for synchronization
 
-    // Copy received activations from symmetric buffer
+    // The data from PE 0 is now in our local nvshmem_act_buffer
+    // Copy from our symmetric buffer to the activation tensor
     float *layer5_output = acts.residual3 + 5 * B * T * C;
-    cudaCheck(cudaMemcpy(layer5_output, model->nvshmem_act_buffer,
-                         B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
+    cudaMemcpyAsync(layer5_output, model->nvshmem_act_buffer,
+                    B * T * C * sizeof(float), cudaMemcpyDeviceToDevice, 0);
+    cudaDeviceSynchronize();
 
     // Process layers 6-11
     for (int l = 6; l < L; l++) {
@@ -1522,10 +1594,13 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     } else {
       model->mean_loss = -1.0f;
     }
+    }  // end if (nvshmem_act_buffer != NULL)
   }
 
-  // Synchronize before returning
-  nvshmem_barrier_all();
+  // Synchronize before returning (only if NVSHMEM buffers are allocated)
+  if (model->nvshmem_act_buffer != NULL) {
+    nvshmem_barrier_all();
+  }
 }
 
 void gpt2_zero_grad(GPT2 *model) {
