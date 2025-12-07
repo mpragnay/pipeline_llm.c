@@ -66,7 +66,6 @@ void cublasCheck(cublasStatus_t status, const char *file, int line) {
     cublasCheck((status), __FILE__, __LINE__);                                 \
   }
 
-static cublasComputeType_t cublas_compute_type;
 cublasHandle_t cublas_handle;
 
 namespace cg = cooperative_groups;
@@ -321,6 +320,14 @@ __global__ void residual_forward_kernel(float *out, float *inp1, float *inp2,
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < N) {
     out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
+  }
+}
+
+// Kernel for in-place addition: a[i] += b[i]
+__global__ void add_inplace_kernel(float *a, const float *b, size_t N) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) {
+    a[idx] += b[idx];
   }
 }
 
@@ -1773,8 +1780,57 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
   }
 
-  // Synchronize before returning
-  nvshmem_barrier_all();
+  // Synchronize gradients across all GPUs using allreduce
+  // Each GPU has computed gradients for its subset of layers
+  // We need to sum all gradients so both GPUs have complete gradients
+  nvshmem_barrier_all(); // Ensure all GPUs finished backward pass
+
+  // Perform allreduce on gradients to sum them across all PEs
+  // This ensures both GPUs have the complete gradients for all parameters
+  int num_pes = nvshmem_n_pes();
+  if (num_pes > 1) {
+    // Allocate temporary buffer for allreduce operation
+    static float *temp_grads = NULL;
+    if (temp_grads == NULL) {
+      cudaCheck(cudaMalloc((void **)&temp_grads,
+                           model->num_parameters * sizeof(float)));
+    }
+
+    // Simpler approach: GPU 0 gathers all gradients, sums them, and broadcasts
+    // back
+    if (my_pe == 0) {
+      // Copy our own gradients to temp buffer
+      cudaCheck(cudaMemcpy(temp_grads, model->grads_memory,
+                           model->num_parameters * sizeof(float),
+                           cudaMemcpyDeviceToDevice));
+
+      // Get gradients from GPU 1 into grads_memory (overwrites GPU 0's
+      // gradients temporarily)
+      nvshmem_getmem(model->grads_memory, model->grads_memory,
+                     model->num_parameters * sizeof(float), 1);
+      nvshmem_quiet();
+
+      // Sum: grads_memory (GPU1) += temp_grads (GPU0)
+      int block_size = 256;
+      int num_blocks = CEIL_DIV(model->num_parameters, block_size);
+      add_inplace_kernel<<<num_blocks, block_size>>>(
+          model->grads_memory, temp_grads, model->num_parameters);
+      cudaCheck(cudaGetLastError());
+      cudaCheck(cudaDeviceSynchronize());
+
+      // Now grads_memory on GPU 0 has the sum of all gradients
+      // Broadcast summed gradients back to GPU 1
+      nvshmem_putmem(model->grads_memory, model->grads_memory,
+                     model->num_parameters * sizeof(float), 1);
+      nvshmem_quiet();
+    } else if (my_pe == 1) {
+      // GPU 1: Wait for GPU 0 to fetch our gradients and send back the sum
+      // GPU 0 will getmem our gradients, sum them, then putmem the result
+      // We just wait for the barrier
+    }
+
+    nvshmem_barrier_all(); // Ensure gradient synchronization is complete
+  }
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
