@@ -1460,14 +1460,18 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
   }
 
   // GPU 1: Layers 6-11 + Final LayerNorm + Loss
-  else if (my_pe == 1) {
+  nvshmem_barrier_all();
+
+  if (my_pe == 1) {
     // Wait for GPU 0 to complete transfer
-    nvshmem_barrier_all();
 
     // Copy received activations from GPU 0's symmetric buffer
     float *layer5_output = acts.residual3 + 5 * B * T * C;
-    nvshmem_getmem(layer5_output, model->nvshmem_act_buffer,
-                   B * T * C * sizeof(float), 0); // From PE 0
+    cudaMemcpy(layer5_output, model->nvshmem_act_buffer,
+               B * T * C * sizeof(float), cudaMemcpyDeviceToDevice);
+
+    // nvshmem_getmem(layer5_output, model->nvshmem_act_buffer,
+    //                B * T * C * sizeof(float), 0); // From PE 0
 
     // Process layers 6-11
     for (int l = 6; l < L; l++) {
@@ -1696,13 +1700,15 @@ void gpt2_backward(GPT2 *model) {
   }
 
   // GPU 0: Backward through layers 5-0 + Embedding
-  else if (my_pe == 0) {
-    // Wait for GPU 1 to send gradients
-    nvshmem_barrier_all();
+  nvshmem_barrier_all();
 
+  if (my_pe == 0) {
+    // Wait for GPU 1 to send gradients
+    cudaMemcpy(dresidual, model->nvshmem_grad_buffer, B * T * C * sizeof(float),
+               cudaMemcpyDeviceToDevice);
     // Copy received gradients from GPU 1's symmetric buffer
-    nvshmem_getmem(dresidual, model->nvshmem_grad_buffer,
-                   B * T * C * sizeof(float), 1); // From PE 1
+    // nvshmem_getmem(dresidual, model->nvshmem_grad_buffer,
+    //               B * T * C * sizeof(float), 1); // From PE 1
 
     // Backward through layers 5-0
     for (int l = 5; l >= 0; l--) {
@@ -1790,7 +1796,7 @@ void gpt2_backward(GPT2 *model) {
   // ncclAllReduce with ncclAvg automatically averages, so we don't need to
   // scale
   ncclCheck(ncclAllReduce((const void *)grads.wte, (void *)grads.wte, Vp * C,
-                          ncclFloat, ncclAvg, model->nccl_comm, 0));
+                          ncclFloat, ncclSum, model->nccl_comm, 0));
 
   nvshmem_barrier_all();
 }
