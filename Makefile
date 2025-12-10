@@ -307,7 +307,7 @@ nvshmem_train_gpt2: nvshmem_train_gpt2.cu
 		-arch=sm_80 \
 		-I$(NVSHMEM_HOME)/include -L$(NVSHMEM_HOME)/lib \
 		-I$(OPENMPI_INCLUDE_PATH) -L$(OPENMPI_LIB_PATH) \
-    $^ -lnvshmem_host -lnvshmem_device -lcublas -lcublasLt -lcuda -lcudart -lnvidia-ml -lmpi \
+    $^ -lnvshmem_host -lnccl -lnvshmem_device -lcublas -lcublasLt -lcuda -lcudart -lnvidia-ml -lmpi \
 		$(if $(filter 1,$(NCCL_FOUND)),-lnccl,) \
 		$(CUDA_OUTPUT_FILE)
 

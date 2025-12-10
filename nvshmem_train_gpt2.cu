@@ -45,6 +45,8 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 // convenience macro for calculating grid/block dimensions for kernels
 #define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
 
+int counter = 0;
+
 // CUDA error checking
 void cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
@@ -963,7 +965,7 @@ void attention_backward(float *dinp, float *dqkvr, float *dpreatt, float *datt,
 
 // replaces logits with logit gradients
 void fused_classifier3(float *logits, float *losses, const float *dlosses,
-                       const int *targets, int B, int T, int V, int P) {
+		const int *targets, int B, int T, int V, int P) {
   const int block_size = 1024;
   const int N = B * T;
   const int grid_size = N;
@@ -1314,9 +1316,29 @@ void gpt2_allocate_nvshmem_buffers(GPT2 *model) {
       cudaMemset(model->nvshmem_grad_buffer, 0, model->nvshmem_buffer_size));
 }
 
+void printer(int B, int T, int C, float* arr, char* initial)
+    {
+      size_t n = (size_t)B * T * C;
+      // allocate pinned host memory for faster transfer
+      float *host_buf = NULL;
+      cudaCheck(cudaMallocHost((void **)&host_buf, n * sizeof(float)));
+      cudaCheck(cudaMemcpy(host_buf, arr, n * sizeof(float), cudaMemcpyDeviceToHost));
+      // Print a limited prefix to avoid huge output
+      size_t max_print = n < 10 ? n : 10;
+      int my_pe = nvshmem_my_pe();
+      for (size_t i = 0; i < max_print; ++i) {
+        printf("counter=%d [PE %d] %s[%zu] = %f\n",counter, my_pe, initial, i,  host_buf[i]);
+      }
+      if (n > max_print) {
+        printf("FORWARD[PE %d] ... (truncated, total %zu elements)\n", my_pe, n);
+      }
+      cudaFreeHost(host_buf);
+    }
+
+
 void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
   // targets are optional and could be NULL
-
+  counter++;
   // ensure the model was initialized or error out
   if (model->params_memory == NULL) {
     printf("Error: model was not initialized properly.\n");
@@ -1444,10 +1466,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     // Copy layer 5 output to GPU 1's symmetric buffer directly
     float *layer5_output = acts.residual3 + 5 * B * T * C;
 
+    
     // Use nvshmem_putmem to transfer directly to PE 1
     nvshmem_putmem(model->nvshmem_act_buffer, layer5_output,
                    B * T * C * sizeof(float), 1); // PE 1
     nvshmem_quiet();
+    
 
     // GPU 0 doesn't compute loss, but needs to set mean_loss for backward pass
     // If targets provided, set to a valid value (GPU 1 has the actual loss)
@@ -1601,12 +1625,12 @@ void gpt2_backward(GPT2 *model) {
   }
 
   // convenience shortcuts
-  int B = model->batch_size;
-  int T = model->seq_len;
+  int B = model->batch_size; ;
+  int T =  model->seq_len; ;
   int Vp = model->config.padded_vocab_size;
   int L = model->config.num_layers;
   int NH = model->config.num_heads;
-  int C = model->config.channels;
+  int C = model->config.channels ;
 
   // Pipeline backward pass - split between 2 GPUs
   int my_pe = nvshmem_my_pe();
@@ -1697,6 +1721,25 @@ void gpt2_backward(GPT2 *model) {
     nvshmem_putmem(model->nvshmem_grad_buffer, dresidual,
                    B * T * C * sizeof(float), 0); // PE 0
     nvshmem_quiet();
+
+    // dresidual points to device memory. Copy to host before printing
+    {
+      size_t n = (size_t)B * T * C;
+      // allocate pinned host memory for faster transfer
+      float *host_buf = NULL;
+      cudaCheck(cudaMallocHost((void **)&host_buf, n * sizeof(float)));
+      cudaCheck(cudaMemcpy(host_buf, model->nvshmem_grad_buffer, n * sizeof(float), cudaMemcpyDeviceToHost));
+      // Print a limited prefix to avoid huge output
+      size_t max_print = n < 10 ? n : 10;
+      int my_pe = nvshmem_my_pe();
+      for (size_t i = 0; i < max_print; ++i) {
+        printf("[PE %d] nvshmem_grad_buffer[%zu] = %f\n", my_pe, i, host_buf[i]);
+      }
+      if (n > max_print) {
+        printf("[PE %d] ... (truncated, total %zu elements)\n", my_pe, n);
+      }
+      cudaFreeHost(host_buf);
+    }
   }
 
   // GPU 0: Backward through layers 5-0 + Embedding
@@ -1706,6 +1749,25 @@ void gpt2_backward(GPT2 *model) {
     // Wait for GPU 1 to send gradients
     cudaMemcpy(dresidual, model->nvshmem_grad_buffer, B * T * C * sizeof(float),
                cudaMemcpyDeviceToDevice);
+    
+    // dresidual points to device memory. Copy to host before printing
+    {
+      size_t n = (size_t)B * T * C;
+      // allocate pinned host memory for faster transfer
+      float *host_buf = NULL;
+      cudaCheck(cudaMallocHost((void **)&host_buf, n * sizeof(float)));
+      cudaCheck(cudaMemcpy(host_buf, dresidual, n * sizeof(float), cudaMemcpyDeviceToHost));
+      // Print a limited prefix to avoid huge output
+      size_t max_print = n < 10 ? n : 10;
+      int my_pe = nvshmem_my_pe();
+      for (size_t i = 0; i < max_print; ++i) {
+        printf("[PE %d] dresidual[%zu] = %f\n", my_pe, i, host_buf[i]);
+      }
+      if (n > max_print) {
+        printf("[PE %d] ... (truncated, total %zu elements)\n", my_pe, n);
+      }
+      cudaFreeHost(host_buf);
+    }
     // Copy received gradients from GPU 1's symmetric buffer
     // nvshmem_getmem(dresidual, model->nvshmem_grad_buffer,
     //               B * T * C * sizeof(float), 1); // From PE 1
@@ -2000,8 +2062,8 @@ int main(int argc, char *argv[]) {
   const char *val_data_pattern =
       "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
   const char *output_log_file = NULL;
-  int B = 4;    // batch size
-  int T = 1024; // sequence length max
+  int B = 4 ;    // batch size
+  int T = 1024 ; // sequence length max
   float learning_rate = 3e-4f;
   int val_loss_every = 20; // every how many steps do we eval validation loss?
   int val_max_steps =
