@@ -1338,6 +1338,7 @@ void printer(int B, int T, int C, float* arr, char* initial)
 
 void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
   // targets are optional and could be NULL
+  counter++;
   // ensure the model was initialized or error out
   if (model->params_memory == NULL) {
     printf("Error: model was not initialized properly.\n");
@@ -1467,7 +1468,6 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
 
     
     // Use nvshmem_putmem to transfer directly to PE 1
-    cudaCheck(cudaDeviceSynchronize());
     nvshmem_putmem(model->nvshmem_act_buffer, layer5_output,
                    B * T * C * sizeof(float), 1); // PE 1
     nvshmem_quiet();
@@ -1588,8 +1588,6 @@ void gpt2_zero_grad(GPT2 *model) {
 }
 
 void gpt2_backward(GPT2 *model) {
-
-  counter++;
 
   // double check we forwarded previously, with targets
   if (model->mean_loss == -1.0f) {
@@ -1719,12 +1717,13 @@ void gpt2_backward(GPT2 *model) {
                          l_ln1_mean, l_ln1_rstd, B, T, C);
     }
 
-    cudaCheck(cudaDeviceSynchronize());
     // Transfer gradients to GPU 0 using nvshmem_putmem
     nvshmem_putmem(model->nvshmem_grad_buffer, dresidual,
                    B * T * C * sizeof(float), 0); // PE 0
     nvshmem_quiet();
     
+    printer(B,T,C, model->nvshmem_grad_buffer, "BACKWARD:nvshmem_grad_buffer");
+    printer(B,T,C, dresidual, "BACKWARD:dresidual");
 
   }
 
@@ -1733,10 +1732,16 @@ void gpt2_backward(GPT2 *model) {
 
   if (my_pe == 0) {
     // Wait for GPU 1 to send gradients
-    
     cudaMemcpy(dresidual, model->nvshmem_grad_buffer, B * T * C * sizeof(float),
                cudaMemcpyDeviceToDevice);
     
+    printer(B,T,C, model->nvshmem_grad_buffer, "BACKWARD:nvshmem_grad_buffer");
+    printer(B,T,C, dresidual, "BACKWARD:dresidual");
+    
+    // Copy received gradients from GPU 1's symmetric buffer
+    // nvshmem_getmem(dresidual, model->nvshmem_grad_buffer,
+    //               B * T * C * sizeof(float), 1); // From PE 1
+
     // Backward through layers 5-0
     for (int l = 5; l >= 0; l--) {
       residual = (l == 0) ? acts.encoded : acts.residual3 + (l - 1) * B * T * C;
