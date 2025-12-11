@@ -1216,7 +1216,7 @@ typedef struct {
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path) {
-
+   printf("oioioioioi_anand\n");
   // read in model from a checkpoint file
   FILE *model_file = fopenCheck(checkpoint_path, "rb");
   int model_header[256];
