@@ -1745,8 +1745,14 @@ int main(int argc, char *argv[]) {
     int loss_count = 0;
 
     // Pipeline execution with warmup, steady, and cooldown phases
-    // Total pipeline steps = num_microbatches + (world_size - 1)
-    int total_pipeline_steps = num_microbatches + world_size - 1;
+    // Total pipeline steps accounts for:
+    // - num_microbatches forward passes per stage
+    // - num_microbatches backward passes per stage
+    // - (world_size - 1) pipeline fill/drain overhead
+    int total_pipeline_steps = 2 * num_microbatches + world_size - 1;
+    printf(\"[DEBUG] Total pipeline steps: %d (num_mb=%d, num_stages=%d)\\n\",
+           total_pipeline_steps,
+           num_microbatches, world_size);
 
     for (int pipeline_step = 0; pipeline_step < total_pipeline_steps;
          pipeline_step++) {
