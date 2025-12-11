@@ -35,8 +35,6 @@ Key Features:
 // ----------------------------------------------------------------------------
 // CUDA utils
 
-#define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
-
 void cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
     printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
@@ -1657,12 +1655,12 @@ int main(int argc, char *argv[]) {
   printf("[Stage %d] NCCL communicator initialized\n", rank);
 
   // Load training data
-  Dataloader train_loader;
+  DataLoader train_loader;
   dataloader_init(&train_loader, train_data_pattern,
                   microbatch_size * num_microbatches, seq_len, 0, 1, 1);
 
   // Load validation data
-  Dataloader val_loader;
+  DataLoader val_loader;
   dataloader_init(&val_loader, val_data_pattern,
                   microbatch_size * num_microbatches, seq_len, 0, 1, 0);
 
