@@ -310,6 +310,14 @@ nvshmem_train_gpt2: nvshmem_train_gpt2.cu
     $^ -lnvshmem_host -lnccl -lnvshmem_device -lcublas -lcublasLt -lcuda -lcudart -lnvidia-ml -lmpi \
 		$(if $(filter 1,$(NCCL_FOUND)),-lnccl,) \
 		$(CUDA_OUTPUT_FILE)
+nvshmem_train_gpt2_partitioned: nvshmem_train_gpt2_partitioned.cu
+	$(NVCC) --threads=0 -t=0 --use_fast_math -std=c++14 -O3 \
+		-arch=sm_80 \
+		-I$(NVSHMEM_HOME)/include -L$(NVSHMEM_HOME)/lib \
+		-I$(OPENMPI_INCLUDE_PATH) -L$(OPENMPI_LIB_PATH) \
+    $^ -lnvshmem_host -lnccl -lnvshmem_device -lcublas -lcublasLt -lcuda -lcudart -lnvidia-ml -lmpi \
+		$(if $(filter 1,$(NCCL_FOUND)),-lnccl,) \
+		$(CUDA_OUTPUT_FILE)
 
 clean:
 	$(REMOVE_FILES) $(TARGETS) test_nccl test_nvshmem nvshmem_train_gpt2
