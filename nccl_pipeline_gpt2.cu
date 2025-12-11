@@ -1793,24 +1793,35 @@ int main(int argc, char *argv[]) {
 
       // BACKWARD PASS
       if (bwd_mb >= 0 && bwd_mb < num_microbatches) {
+        printf("[Stage %d] Backward microbatch %d\n", rank, bwd_mb);
         // Receive gradient from next stage (if not last stage)
         if (!stage.pipe_config.is_last_stage) {
+          printf("[Stage %d] Receiving gradient from stage %d...\n", rank,
+                 rank + 1);
           ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size,
                              ncclFloat, rank + 1, stage.nccl_comm,
                              cudaStreamDefault));
+          printf("[Stage %d] Received gradient\n", rank);
         }
 
         // Execute backward pass for this microbatch
+        printf("[Stage %d] Executing backward pass...\n", rank);
         stage_backward(&stage, bwd_mb);
+        printf("[Stage %d] Backward pass complete\n", rank);
 
         // Accumulate gradients
+        printf("[Stage %d] Accumulating gradients...\n", rank);
         stage_accumulate_gradients(&stage);
+        printf("[Stage %d] Gradients accumulated\n", rank);
 
         // Send gradient to previous stage (if not first stage)
         if (!stage.pipe_config.is_first_stage) {
+          printf("[Stage %d] Sending gradient to stage %d...\n", rank,
+                 rank - 1);
           ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
                              ncclFloat, rank - 1, stage.nccl_comm,
                              cudaStreamDefault));
+          printf("[Stage %d] Sent gradient\n", rank);
         }
       }
 
