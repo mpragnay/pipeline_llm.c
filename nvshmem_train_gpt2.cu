@@ -1351,6 +1351,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
   int NH = model->config.num_heads;
   int C = model->config.channels;
 
+  int my_pe = nvshmem_my_pe();
+  int n_pes = nvshmem_n_pes();
+  int layers_per_pe = L / n_pes;
+  int layer_start = my_pe * layers_per_pe;
+  int layer_end = (my_pe == n_pes - 1) ? L : (my_pe + 1) * layers_per_pe;
+
   // validate inputs, all indices must be in the range [0, V)
   for (int i = 0; i < B * T; i++) {
     assert(0 <= inputs[i] && inputs[i] < V);
@@ -1399,19 +1405,28 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
                          cudaMemcpyHostToDevice));
   }
 
-  // Pipeline forward pass - split between 2 GPUs
-  int my_pe = nvshmem_my_pe();
+  // Pipeline forward pass - split between n GPUs
   ParameterTensors params = model->params; // for brevity
   ActivationTensors acts = model->acts;
   float *residual;
-
+  for (int target_pe = 0; target_pe < n_pes; target_pe++) {
+  if (my_pe == target_pe) {
   // GPU 0: Embedding + Layers 0-5
   if (my_pe == 0) {
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T,
                     C);
+  }
+  nvshmem_barrier_all();
+  if (my_pe > 0)
+  {
+	  float *recv_location = (layer_start == 0) ? acts.encoded
+		  		: acts.residual3 + (layer_start - 1) * B * T * C;
+	  cudaCheck(cudaMemcpy(recv_location, model->nvshmem_act_buffer,
+			  B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
+	  //printer(B, T, C, recv_location,  "FORWARD:recv");
+  }
 
-    // Process layers 0-5
-    for (int l = 0; l < 6; l++) {
+    for (int l = layer_start; l < layer_end; l++) {
       residual = (l == 0) ? acts.encoded : acts.residual3 + (l - 1) * B * T * C;
 
       // Get layer weight pointers
@@ -1462,118 +1477,52 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
       residual_forward(l_residual3, l_residual2, l_fcproj, B * T * C);
     }
 
-    // Copy layer 5 output to GPU 1's symmetric buffer directly
-    float *layer5_output = acts.residual3 + 5 * B * T * C;
+    if (my_pe < n_pes - 1) {
+	    // Copy layer 5 output to GPU 1's symmetric buffer directly
+	    float *layer5_output = acts.residual3 + (layer_end - 1) * B * T * C;
 
-    
-    // Use nvshmem_putmem to transfer directly to PE 1
-    cudaCheck(cudaDeviceSynchronize());
-    nvshmem_putmem(model->nvshmem_act_buffer, layer5_output,
-                   B * T * C * sizeof(float), 1); // PE 1
-    nvshmem_quiet();
-    
+	    
+	    // Use nvshmem_putmem to transfer directly to PE 1
+	    cudaCheck(cudaDeviceSynchronize());
+	    nvshmem_putmem(model->nvshmem_act_buffer, layer5_output,
+			   B * T * C * sizeof(float), my_pe + 1); // PE 1
+	    nvshmem_quiet();
 
-    // GPU 0 doesn't compute loss, but needs to set mean_loss for backward pass
-    // If targets provided, set to a valid value (GPU 1 has the actual loss)
-    // If no targets (inference), set to -1.0
-    if (targets != NULL) {
-      model->mean_loss = 0.0f; // Valid placeholder for backward check
-    } else {
-      model->mean_loss = -1.0f; // No targets, inference mode
+	    //printer(B, T, C, model->nvshmem_act_buffer, "FORWARD:nvshmem_act_buffer");
+	    //printer(B, T, C, layer5_output, "FORWARD:layer5_output");
+    }
+
+    if (my_pe == n_pes - 1)
+    {
+	    residual = acts.residual3 + (L - 1) * B * T * C;
+	    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual,
+			    params.lnfw, params.lnfb, B, T, C);
+	    matmul_forward(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+
+	    if (targets != NULL) {
+		    fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, Vp);
+		    cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses,
+					    B * T * sizeof(float), cudaMemcpyDeviceToHost));
+		    float mean_loss = 0.0f;
+		    for (int i = 0; i < B * T; i++) {
+			    mean_loss += model->cpu_losses[i];
+		    }
+		    mean_loss /= B * T;
+		    model->mean_loss = mean_loss;
+	    } 
+	    else {
+		    model->mean_loss = -1.0f;
+	    }
+    } 
+    else {
+	    // Non-final PEs: set placeholder for backward pass check
+	    model->mean_loss = (targets != NULL) ? 0.0f : -1.0f;
     }
   }
 
-  // GPU 1: Layers 6-11 + Final LayerNorm + Loss
+  // Synchronize all PEs before returning
   nvshmem_barrier_all();
-
-  if (my_pe == 1) {
-    // Wait for GPU 0 to complete transfer
-
-    // Copy received activations from GPU 0's symmetric buffer
-    float *layer5_output = acts.residual3 + 5 * B * T * C;
-    cudaMemcpy(layer5_output, model->nvshmem_act_buffer,
-               B * T * C * sizeof(float), cudaMemcpyDeviceToDevice);
-
-    // nvshmem_getmem(layer5_output, model->nvshmem_act_buffer,
-    //                B * T * C * sizeof(float), 0); // From PE 0
-
-    // Process layers 6-11
-    for (int l = 6; l < L; l++) {
-      residual = acts.residual3 + (l - 1) * B * T * C;
-
-      // Get layer weight pointers
-      float *l_ln1w = params.ln1w + l * C;
-      float *l_ln1b = params.ln1b + l * C;
-      float *l_qkvw = params.qkvw + l * 3 * C * C;
-      float *l_qkvb = params.qkvb + l * 3 * C;
-      float *l_attprojw = params.attprojw + l * C * C;
-      float *l_attprojb = params.attprojb + l * C;
-      float *l_ln2w = params.ln2w + l * C;
-      float *l_ln2b = params.ln2b + l * C;
-      float *l_fcw = params.fcw + l * 4 * C * C;
-      float *l_fcb = params.fcb + l * 4 * C;
-      float *l_fcprojw = params.fcprojw + l * C * 4 * C;
-      float *l_fcprojb = params.fcprojb + l * C;
-
-      // Get layer activation pointers
-      float *l_ln1 = acts.ln1 + l * B * T * C;
-      float *l_ln1_mean = acts.ln1_mean + l * B * T;
-      float *l_ln1_rstd = acts.ln1_rstd + l * B * T;
-      float *l_qkvr = acts.qkvr + l * B * T * 3 * C;
-      float *l_atty = acts.atty + l * B * T * C;
-      float *l_att = acts.att + l * B * NH * T * T;
-      float *l_attproj = acts.attproj + l * B * T * C;
-      float *l_residual2 = acts.residual2 + l * B * T * C;
-      float *l_ln2 = acts.ln2 + l * B * T * C;
-      float *l_ln2_mean = acts.ln2_mean + l * B * T;
-      float *l_ln2_rstd = acts.ln2_rstd + l * B * T;
-      float *l_fch = acts.fch + l * B * T * 4 * C;
-      float *l_fch_gelu = acts.fch_gelu + l * B * T * 4 * C;
-      float *l_fcproj = acts.fcproj + l * B * T * C;
-      float *l_residual3 = acts.residual3 + l * B * T * C;
-      float *scratch = acts.output;
-
-      // Forward pass through this layer
-      layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b,
-                        B, T, C);
-      matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3 * C);
-      attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
-      matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-      residual_forward(l_residual2, residual, l_attproj, B * T * C);
-      layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w,
-                        l_ln2b, B, T, C);
-      matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4 * C);
-      gelu_forward(l_fch_gelu, l_fch, B * T * 4 * C);
-      matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4 * C,
-                     C);
-      residual_forward(l_residual3, l_residual2, l_fcproj, B * T * C);
-    }
-
-    // Final layernorm and output (only on GPU 1)
-    residual = acts.residual3 + (L - 1) * B * T * C;
-    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual,
-                      params.lnfw, params.lnfb, B, T, C);
-    matmul_forward(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
-
-    // Compute loss if targets provided
-    if (targets != NULL) {
-      fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V,
-                        Vp);
-      cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses,
-                           B * T * sizeof(float), cudaMemcpyDeviceToHost));
-      float mean_loss = 0.0f;
-      for (int i = 0; i < B * T; i++) {
-        mean_loss += model->cpu_losses[i];
-      }
-      mean_loss /= B * T;
-      model->mean_loss = mean_loss;
-    } else {
-      model->mean_loss = -1.0f;
-    }
   }
-
-  // Synchronize before returning
-  nvshmem_barrier_all();
 }
 
 void gpt2_zero_grad(GPT2 *model) {
@@ -1588,9 +1537,8 @@ void gpt2_zero_grad(GPT2 *model) {
 }
 
 void gpt2_backward(GPT2 *model) {
-
   counter++;
-
+  //printf("CALLED\n");
   // double check we forwarded previously, with targets
   if (model->mean_loss == -1.0f) {
     printf("Error: must forward with targets before backward\n");
@@ -1636,15 +1584,19 @@ void gpt2_backward(GPT2 *model) {
 
   // Pipeline backward pass - split between 2 GPUs
   int my_pe = nvshmem_my_pe();
+  int n_pes = nvshmem_n_pes();
+  int layers_per_pe = L / n_pes;
+  int layers_start = my_pe * layers_per_pe;
+  int layers_end = (my_pe == n_pes - 1) ? L : (my_pe + 1) * layers_per_pe;
+  
   ParameterTensors params = model->params;
   ParameterTensors grads = model->grads;
   ActivationTensors acts = model->acts;
   GradActTensors grads_acts = model->grads_acts;
   float *residual;
   float *dresidual = grads_acts.residual3;
-
   // GPU 1: Backward through layers 11-6
-  if (my_pe == 1) {
+  if (my_pe == n_pes - 1) {
     // Backward the classifier and final layernorm
     matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf,
                     params.wte, B, T, C, Vp);
@@ -1652,93 +1604,18 @@ void gpt2_backward(GPT2 *model) {
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.bt4c,
                        residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B,
                        T, C);
-
-    // Backward through layers 11-6
-    for (int l = L - 1; l >= 6; l--) {
-      residual = (l == 0) ? acts.encoded : acts.residual3 + (l - 1) * B * T * C;
-
-      // Get weight pointers
-      float *l_ln1w = params.ln1w + l * C;
-      float *l_qkvw = params.qkvw + l * 3 * C * C;
-      float *l_attprojw = params.attprojw + l * C * C;
-      float *l_ln2w = params.ln2w + l * C;
-      float *l_fcw = params.fcw + l * 4 * C * C;
-      float *l_fcprojw = params.fcprojw + l * C * 4 * C;
-
-      // Get gradient pointers
-      float *dl_ln1w = grads.ln1w + l * C;
-      float *dl_ln1b = grads.ln1b + l * C;
-      float *dl_qkvw = grads.qkvw + l * 3 * C * C;
-      float *dl_qkvb = grads.qkvb + l * 3 * C;
-      float *dl_attprojw = grads.attprojw + l * C * C;
-      float *dl_attprojb = grads.attprojb + l * C;
-      float *dl_ln2w = grads.ln2w + l * C;
-      float *dl_ln2b = grads.ln2b + l * C;
-      float *dl_fcw = grads.fcw + l * 4 * C * C;
-      float *dl_fcb = grads.fcb + l * 4 * C;
-      float *dl_fcprojw = grads.fcprojw + l * C * 4 * C;
-      float *dl_fcprojb = grads.fcprojb + l * C;
-
-      // Get activation pointers
-      float *l_ln1 = acts.ln1 + l * B * T * C;
-      float *l_ln1_mean = acts.ln1_mean + l * B * T;
-      float *l_ln1_rstd = acts.ln1_rstd + l * B * T;
-      float *l_qkvr = acts.qkvr + l * B * T * 3 * C;
-      float *l_atty = acts.atty + l * B * T * C;
-      float *l_att = acts.att + l * B * NH * T * T;
-      float *l_residual2 = acts.residual2 + l * B * T * C;
-      float *l_ln2 = acts.ln2 + l * B * T * C;
-      float *l_ln2_mean = acts.ln2_mean + l * B * T;
-      float *l_ln2_rstd = acts.ln2_rstd + l * B * T;
-      float *l_fch = acts.fch + l * B * T * 4 * C;
-      float *l_fch_gelu = acts.fch_gelu + l * B * T * 4 * C;
-
-      // Get gradient activation buffers
-      float *dl_btc = acts.lnf;
-      float *dl_bt4c = grads_acts.bt4c;
-      float *dl_preatt = grads_acts.preatt;
-      float *scratch = acts.output;
-      float *buffer_a = l_atty;
-      float *buffer_b = l_fch;
-
-      // Backward through this layer
-      matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu,
-                      l_fcprojw, B, T, 4 * C, C);
-      gelu_backward(dl_bt4c, l_fch, dl_bt4c, B * T * 4 * C);
-      matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C,
-                      4 * C);
-      layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2,
-                         l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-      matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty,
-                      l_attprojw, B, T, C, C);
-      attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a,
-                         dl_btc, l_qkvr, l_att, B, T, C, NH);
-      matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C,
-                      3 * C);
-      layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w,
-                         l_ln1_mean, l_ln1_rstd, B, T, C);
-    }
-
-    cudaCheck(cudaDeviceSynchronize());
-    // Transfer gradients to GPU 0 using nvshmem_putmem
-    nvshmem_putmem(model->nvshmem_grad_buffer, dresidual,
-                   B * T * C * sizeof(float), 0); // PE 0
-    nvshmem_quiet();
-    
-
   }
-
-  // GPU 0: Backward through layers 5-0 + Embedding
   nvshmem_barrier_all();
-
-  if (my_pe == 0) {
-    // Wait for GPU 1 to send gradients
-    
-    cudaMemcpy(dresidual, model->nvshmem_grad_buffer, B * T * C * sizeof(float),
-               cudaMemcpyDeviceToDevice);
-    
-    // Backward through layers 5-0
-    for (int l = 5; l >= 0; l--) {
+  for (int target_pe = n_pes - 1; target_pe >= 0; target_pe--)
+  {
+  if (my_pe == target_pe) {
+  if (my_pe < n_pes - 1) 
+  {
+    	 cudaCheck(cudaMemcpy(dresidual, model->nvshmem_grad_buffer, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
+	 //printer(B, T, C, dresidual, "BACKWARD:dresidual");
+  }	  
+    // Backward through layers 11-6
+    for (int l = layers_end - 1; l >= layers_start; l--) {
       residual = (l == 0) ? acts.encoded : acts.residual3 + (l - 1) * B * T * C;
 
       // Get weight pointers
@@ -1802,23 +1679,27 @@ void gpt2_backward(GPT2 *model) {
       layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w,
                          l_ln1_mean, l_ln1_rstd, B, T, C);
     }
+    
+    if (my_pe > 0)
+    {
+	    cudaCheck(cudaDeviceSynchronize());
+	    // Transfer gradients to GPU 0 using nvshmem_putmem
+	    nvshmem_putmem(model->nvshmem_grad_buffer, dresidual,
+			   B * T * C * sizeof(float), my_pe - 1); // PE 0
+	    nvshmem_quiet();
+	    //printer(B, T, C, dresidual, "Backward:sent_dresidual");
+    } 
 
-    // Backward through embedding
-    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
+    if (my_pe == 0) {
+	    // Backward through embedding
+	    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
+    }
   }
 
   // Synchronize before returning
   nvshmem_barrier_all();
-
-  // All-reduce wte gradients across all PEs using NCCL
-  // Both GPUs compute partial gradients for wte:
-  // - GPU 1 computes grads.wte during classifier backward (line 1606)
-  // - GPU 0 computes grads.wte during encoder backward (line 1761)
-  // We need to sum and average these gradients across GPUs
-  // Note: wpe, lnfw, and lnfb are only computed on one GPU each, so they don't
-  // need all-reduce
-  int n_pes = nvshmem_n_pes();
-
+  }
+  
   // All-reduce wte gradients: sum across all PEs using NCCL, then average
   // ncclAllReduce with ncclAvg automatically averages, so we don't need to
   // scale
@@ -1990,10 +1871,10 @@ int main(int argc, char *argv[]) {
   int my_pe = nvshmem_my_pe();
   int n_pes = nvshmem_n_pes();
 
-  if (n_pes != 2) {
+  if (n_pes < 2) {
     if (my_pe == 0) {
       fprintf(stderr,
-              "Error: This pipeline implementation requires exactly 2 GPUs, "
+              "Error: This pipeline implementation requires atleast 2 GPUs, "
               "got %d\\n",
               n_pes);
     }
@@ -2219,6 +2100,7 @@ int main(int argc, char *argv[]) {
         // scratch but the inference here is just for sanity checking anyway
         // and we can maybe optimize a bit more later, with careful tests
         gpt2_forward(&model, gen_tokens, NULL, B, T);
+	if (my_pe == 1) {
         // furthermore, below we're only using b=0 (i.e. the first row) of all
         // B rows we're in principle running B "inference streams" in parallel
         // here only using position 0 because it's a bit faster (copy less
@@ -2244,6 +2126,8 @@ int main(int argc, char *argv[]) {
           printf("%d ", next_token);
         }
         fflush(stdout);
+	}
+	MPI_Bcast(&gen_tokens[t], 1, MPI_INT, 1, MPI_COMM_WORLD);
       }
       printf("\n---\n");
     }
@@ -2271,7 +2155,7 @@ int main(int argc, char *argv[]) {
         (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     total_sum_iteration_time_s += time_elapsed_s;
     int tokens_per_second = (B * T) / time_elapsed_s;
-    if (my_pe == 1) {
+    if (my_pe == n_pes - 1) {
     printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1,
            train_num_batches, model.mean_loss, time_elapsed_s * 1000,
            tokens_per_second);
