@@ -2180,8 +2180,15 @@ int main(int argc, char *argv[]) {
   // some memory for generating samples from the model
   unsigned long long rng_state = 1337;
   int *gen_tokens = (int *)mallocCheck(B * T * sizeof(int));
-  int *d_gen_tokens; // GPU memory for gen_tokens (needed for NVSHMEM)
-  cudaCheck(cudaMalloc((void **)&d_gen_tokens, B * T * sizeof(int)));
+  // Allocate d_gen_tokens using NVSHMEM symmetric memory (required for
+  // nvshmem_putmem)
+  int *d_gen_tokens = (int *)nvshmem_malloc(B * T * sizeof(int));
+  if (d_gen_tokens == NULL) {
+    printf(
+        "[PE %d] Error: Failed to allocate NVSHMEM buffer for d_gen_tokens\n",
+        my_pe);
+    exit(EXIT_FAILURE);
+  }
   float *cpu_logits =
       (float *)mallocCheck(model.config.vocab_size * sizeof(float));
 
@@ -2314,7 +2321,7 @@ int main(int argc, char *argv[]) {
   gpt2_free(&model);
   free(cpu_logits);
   free(gen_tokens);
-  cudaCheck(cudaFree(d_gen_tokens));
+  nvshmem_free(d_gen_tokens);
   cublasCheck(cublasDestroy(cublas_handle));
   logger_free(&logger);
 
