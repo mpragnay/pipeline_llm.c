@@ -1509,6 +1509,38 @@ void stage_zero_grad(PipelineStage *stage) {
 }
 
 // ----------------------------------------------------------------------------
+// Sampling utilities for text generation
+
+#define GPT2_EOT 50256
+
+unsigned int random_u32(unsigned long long *state) {
+  *state ^= *state >> 12;
+  *state ^= *state << 25;
+  *state ^= *state >> 27;
+  return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+}
+
+float random_f32(unsigned long long *state) {
+  return (random_u32(state) >> 8) / 16777216.0f;
+}
+
+int sample_softmax(const float *logits, int n, float coin) {
+  double norm = 0;
+  for (int i = 0; i < n; i++) {
+    norm += expf(logits[i]);
+  }
+  coin *= norm;
+  float cdf = 0.0f;
+  for (int i = 0; i < n; i++) {
+    cdf += expf(logits[i]);
+    if (coin < cdf) {
+      return i;
+    }
+  }
+  return n - 1;
+}
+
+// ----------------------------------------------------------------------------
 // Main training loop with NCCL pipeline parallelism
 
 int main(int argc, char *argv[]) {
@@ -1522,11 +1554,17 @@ int main(int argc, char *argv[]) {
   const char *checkpoint_path = "gpt2_124M.bin";
   const char *train_data_pattern =
       "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+  const char *val_data_pattern =
+      "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
   int microbatch_size = 4;
   int num_microbatches = 4;
   int seq_len = 256;
   int num_iterations = 100;
   float learning_rate = 3e-4f;
+  int val_loss_every = 20;
+  int val_max_steps = 20;
+  int sample_every = 20;
+  int genT = 64;
 
   for (int i = 1; i < argc; i += 2) {
     if (i + 1 >= argc) {
@@ -1539,6 +1577,8 @@ int main(int argc, char *argv[]) {
       checkpoint_path = argv[i + 1];
     else if (strcmp(argv[i], "--train_data") == 0)
       train_data_pattern = argv[i + 1];
+    else if (strcmp(argv[i], "--val_data") == 0)
+      val_data_pattern = argv[i + 1];
     else if (strcmp(argv[i], "--batch_size") == 0)
       microbatch_size = atoi(argv[i + 1]);
     else if (strcmp(argv[i], "--num_microbatches") == 0)
@@ -1549,6 +1589,12 @@ int main(int argc, char *argv[]) {
       num_iterations = atoi(argv[i + 1]);
     else if (strcmp(argv[i], "--learning_rate") == 0)
       learning_rate = atof(argv[i + 1]);
+    else if (strcmp(argv[i], "--val_every") == 0)
+      val_loss_every = atoi(argv[i + 1]);
+    else if (strcmp(argv[i], "--sample_every") == 0)
+      sample_every = atoi(argv[i + 1]);
+    else if (strcmp(argv[i], "--gen_tokens") == 0)
+      genT = atoi(argv[i + 1]);
     else {
       if (rank == 0)
         fprintf(stderr, "Unknown argument: %s\n", argv[i]);
@@ -1615,8 +1661,32 @@ int main(int argc, char *argv[]) {
   dataloader_init(&train_loader, train_data_pattern,
                   microbatch_size * num_microbatches, seq_len, 0, 1, 1);
 
-  printf("[Stage %d] Ready for training\n", rank);
+  // Load validation data
+  Dataloader val_loader;
+  dataloader_init(&val_loader, val_data_pattern,
+                  microbatch_size * num_microbatches, seq_len, 0, 1, 0);
+
+  int train_num_batches =
+      train_loader.num_tokens / (microbatch_size * num_microbatches * seq_len);
+  int val_num_batches =
+      val_loader.num_tokens / (microbatch_size * num_microbatches * seq_len);
+  if (val_num_batches > val_max_steps) {
+    val_num_batches = val_max_steps;
+  }
+
+  // Initialize tokenizer for text generation
+  Tokenizer tokenizer;
+  tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+
+  printf("[Stage %d] Ready for training (%d train batches, %d val batches)\n",
+         rank, train_num_batches, val_num_batches);
   MPI_Barrier(MPI_COMM_WORLD);
+
+  // Setup for text generation
+  unsigned long long rng_state = 1337 + rank;
+  int *gen_tokens = (int *)mallocCheck(microbatch_size * seq_len * sizeof(int));
+  float *cpu_logits =
+      (float *)mallocCheck(stage.config.vocab_size * sizeof(float));
 
   // Training loop
   cudaEvent_t start_event, end_event;
@@ -1728,14 +1798,139 @@ int main(int argc, char *argv[]) {
       int tokens_per_sec =
           (int)((microbatch_size * num_microbatches * seq_len) /
                 (milliseconds / 1000.0f));
-      printf(
-          "Iter %4d/%d | Loss: %.4f | Time: %.2f ms | Throughput: %d tok/s\n",
-          iter + 1, num_iterations, avg_loss, milliseconds, tokens_per_sec);
+      printf("step %4d/%d: train loss %.6f (%.2f ms, %d tok/s)\n", iter + 1,
+             train_num_batches, avg_loss, milliseconds, tokens_per_sec);
+    }
+
+    // Validation
+    if ((val_loss_every > 0 && (iter + 1) % val_loss_every == 0) ||
+        iter == num_iterations - 1) {
+      float val_loss = 0.0f;
+      dataloader_reset(&val_loader);
+      for (int i = 0; i < val_num_batches; i++) {
+        dataloader_next_batch(&val_loader);
+        cudaCheck(cudaMemcpy(stage.inputs, val_loader.inputs,
+                             microbatch_size * num_microbatches * seq_len *
+                                 sizeof(int),
+                             cudaMemcpyHostToDevice));
+        cudaCheck(cudaMemcpy(stage.targets, val_loader.targets,
+                             microbatch_size * num_microbatches * seq_len *
+                                 sizeof(int),
+                             cudaMemcpyHostToDevice));
+
+        // Forward pass only (no backward)
+        for (int mb = 0; mb < num_microbatches; mb++) {
+          // All stages participate in forward
+          if (!stage.pipe_config.is_first_stage) {
+            ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size,
+                               ncclFloat, rank - 1, stage.nccl_comm,
+                               cudaStreamDefault));
+          }
+          stage_forward(&stage, mb);
+          if (!stage.pipe_config.is_last_stage) {
+            ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                               ncclFloat, rank + 1, stage.nccl_comm,
+                               cudaStreamDefault));
+          }
+          if (stage.pipe_config.is_last_stage) {
+            val_loss += stage.mean_loss;
+          }
+          cudaCheck(cudaDeviceSynchronize());
+        }
+      }
+
+      // Average and broadcast validation loss
+      if (stage.pipe_config.is_last_stage) {
+        val_loss /= (val_num_batches * num_microbatches);
+      }
+      MPI_Bcast(&val_loss, 1, MPI_FLOAT, world_size - 1, MPI_COMM_WORLD);
+
+      if (rank == 0) {
+        printf("val loss %.6f\n", val_loss);
+      }
+    }
+
+    // Text generation
+    if ((sample_every > 0 && (iter + 1) % sample_every == 0) ||
+        iter == num_iterations - 1) {
+      // Initialize generation tokens
+      for (int i = 0; i < microbatch_size * seq_len; i++) {
+        gen_tokens[i] = GPT2_EOT;
+      }
+
+      if (rank == 0) {
+        printf("generating:\n---\n");
+      }
+
+      // Generate text autoregressively
+      for (int t = 1; t < genT; t++) {
+        // Copy tokens to GPU
+        cudaCheck(cudaMemcpy(stage.inputs, gen_tokens,
+                             microbatch_size * seq_len * sizeof(int),
+                             cudaMemcpyHostToDevice));
+
+        // All stages participate in forward pass
+        if (!stage.pipe_config.is_first_stage) {
+          ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size,
+                             ncclFloat, rank - 1, stage.nccl_comm,
+                             cudaStreamDefault));
+        }
+        stage_forward(&stage, 0); // Use first microbatch slot
+        if (!stage.pipe_config.is_last_stage) {
+          ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                             ncclFloat, rank + 1, stage.nccl_comm,
+                             cudaStreamDefault));
+        }
+        cudaCheck(cudaDeviceSynchronize());
+
+        // Only last stage samples
+        int next_token = 0;
+        if (stage.pipe_config.is_last_stage) {
+          ActivationTensors acts = stage.acts_microbatch[0];
+          int Vp = stage.config.padded_vocab_size;
+          int V = stage.config.vocab_size;
+
+          // Get logits for position t-1
+          float *logits = acts.output + (t - 1) * Vp;
+          cudaCheck(cudaMemcpy(cpu_logits, logits, V * sizeof(float),
+                               cudaMemcpyDeviceToHost));
+
+          // Sample next token
+          float coin = random_f32(&rng_state);
+          next_token = sample_softmax(cpu_logits, V, coin);
+          gen_tokens[t] = next_token;
+        }
+
+        // Broadcast sampled token to all ranks
+        MPI_Bcast(&next_token, 1, MPI_INT, world_size - 1, MPI_COMM_WORLD);
+        if (rank != world_size - 1) {
+          gen_tokens[t] = next_token;
+        }
+
+        // Print token (rank 0 only)
+        if (rank == 0) {
+          if (tokenizer.init_ok) {
+            const char *token_str = tokenizer_decode(&tokenizer, next_token);
+            safe_printf(token_str);
+          } else {
+            printf("%d ", next_token);
+          }
+          fflush(stdout);
+        }
+      }
+
+      if (rank == 0) {
+        printf("\n---\n");
+      }
     }
   }
 
   // Cleanup
   dataloader_free(&train_loader);
+  dataloader_free(&val_loader);
+  tokenizer_free(&tokenizer);
+  free(gen_tokens);
+  free(cpu_logits);
   ncclCommDestroy(stage.nccl_comm);
 
   // Free stage memory
