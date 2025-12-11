@@ -1817,9 +1817,9 @@ void gpt2_backward(GPT2 *model) {
   // need all-reduce
   int n_pes = nvshmem_n_pes();
 
-  // All-reduce wte gradients: sum across all PEs using NCCL, then average
-  // ncclAllReduce with ncclAvg automatically averages, so we don't need to
-  // scale
+  // All-reduce wte gradients: sum across all PEs using NCCL
+  // We use ncclSum to accumulate gradients from both GPUs
+  // The AdamW optimizer will apply the combined gradients to all parameters
   ncclCheck(ncclAllReduce((const void *)grads.wte, (void *)grads.wte, Vp * C,
                           ncclFloat, ncclSum, model->nccl_comm, 0));
 
@@ -1868,6 +1868,13 @@ void gpt2_free(GPT2 *model) {
   cudaCheck(cudaFree(model->inputs));
   cudaCheck(cudaFree(model->targets));
   cudaFreeHost(model->cpu_losses);
+  // Free NVSHMEM symmetric buffers
+  if (model->nvshmem_act_buffer != NULL) {
+    nvshmem_free(model->nvshmem_act_buffer);
+  }
+  if (model->nvshmem_grad_buffer != NULL) {
+    nvshmem_free(model->nvshmem_grad_buffer);
+  }
   // Clean up NCCL communicator
   ncclCommDestroy(model->nccl_comm);
 }
@@ -2266,11 +2273,19 @@ int main(int argc, char *argv[]) {
         }
 
         // Synchronize d_gen_tokens across GPUs so GPU 0 has the latest tokens
-        // GPU 1 broadcasts the updated d_gen_tokens to GPU 0
+        // GPU 1 writes to GPU 0's symmetric buffer, then GPU 0 reads from it
         nvshmem_barrier_all();
         if (my_pe == 1) {
           nvshmem_putmem(d_gen_tokens, d_gen_tokens, B * T * sizeof(int), 0);
           nvshmem_quiet();
+        }
+        nvshmem_barrier_all();
+        // GPU 0 must copy from its symmetric buffer to its local d_gen_tokens
+        if (my_pe == 0) {
+          // The putmem from GPU 1 wrote into GPU 0's symmetric d_gen_tokens
+          // buffer Since d_gen_tokens is already a symmetric buffer, no copy
+          // needed The nvshmem_putmem already updated GPU 0's d_gen_tokens
+          // in-place
         }
         nvshmem_barrier_all();
       }
