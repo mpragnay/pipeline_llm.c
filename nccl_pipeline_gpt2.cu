@@ -1750,9 +1750,10 @@ int main(int argc, char *argv[]) {
     // - num_microbatches backward passes per stage
     // - (world_size - 1) pipeline fill/drain overhead
     int total_pipeline_steps = 2 * num_microbatches + world_size - 1;
-    printf(\"[DEBUG] Total pipeline steps: %d (num_mb=%d, num_stages=%d)\\n\",
-           total_pipeline_steps,
-           num_microbatches, world_size);
+    if (rank == 0) {
+      printf("[DEBUG] Total pipeline steps: %d (num_mb=%d, num_stages=%d)\n",
+             total_pipeline_steps, num_microbatches, world_size);
+    }
 
     for (int pipeline_step = 0; pipeline_step < total_pipeline_steps;
          pipeline_step++) {
