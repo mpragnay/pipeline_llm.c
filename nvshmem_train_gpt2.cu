@@ -965,7 +965,7 @@ void attention_backward(float *dinp, float *dqkvr, float *dpreatt, float *datt,
 
 // replaces logits with logit gradients
 void fused_classifier3(float *logits, float *losses, const float *dlosses,
-		const int *targets, int B, int T, int V, int P) {
+                       const int *targets, int B, int T, int V, int P) {
   const int block_size = 1024;
   const int N = B * T;
   const int grid_size = N;
@@ -1316,25 +1316,25 @@ void gpt2_allocate_nvshmem_buffers(GPT2 *model) {
       cudaMemset(model->nvshmem_grad_buffer, 0, model->nvshmem_buffer_size));
 }
 
-void printer(int B, int T, int C, float* arr, char* initial)
-    {
-      size_t n = (size_t)B * T * C;
-      // allocate pinned host memory for faster transfer
-      float *host_buf = NULL;
-      cudaCheck(cudaMallocHost((void **)&host_buf, n * sizeof(float)));
-      cudaCheck(cudaMemcpy(host_buf, arr, n * sizeof(float), cudaMemcpyDeviceToHost));
-      // Print a limited prefix to avoid huge output
-      size_t max_print = n < 10 ? n : 10;
-      int my_pe = nvshmem_my_pe();
-      for (size_t i = 0; i < max_print; ++i) {
-        printf("counter=%d [PE %d] %s[%zu] = %f\n",counter, my_pe, initial, i,  host_buf[i]);
-      }
-      if (n > max_print) {
-        printf("FORWARD[PE %d] ... (truncated, total %zu elements)\n", my_pe, n);
-      }
-      cudaFreeHost(host_buf);
-    }
-
+void printer(int B, int T, int C, float *arr, char *initial) {
+  size_t n = (size_t)B * T * C;
+  // allocate pinned host memory for faster transfer
+  float *host_buf = NULL;
+  cudaCheck(cudaMallocHost((void **)&host_buf, n * sizeof(float)));
+  cudaCheck(
+      cudaMemcpy(host_buf, arr, n * sizeof(float), cudaMemcpyDeviceToHost));
+  // Print a limited prefix to avoid huge output
+  size_t max_print = n < 10 ? n : 10;
+  int my_pe = nvshmem_my_pe();
+  for (size_t i = 0; i < max_print; ++i) {
+    printf("counter=%d [PE %d] %s[%zu] = %f\n", counter, my_pe, initial, i,
+           host_buf[i]);
+  }
+  if (n > max_print) {
+    printf("FORWARD[PE %d] ... (truncated, total %zu elements)\n", my_pe, n);
+  }
+  cudaFreeHost(host_buf);
+}
 
 void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
   // targets are optional and could be NULL
@@ -1465,13 +1465,11 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     // Copy layer 5 output to GPU 1's symmetric buffer directly
     float *layer5_output = acts.residual3 + 5 * B * T * C;
 
-    
     // Use nvshmem_putmem to transfer directly to PE 1
     cudaCheck(cudaDeviceSynchronize());
     nvshmem_putmem(model->nvshmem_act_buffer, layer5_output,
                    B * T * C * sizeof(float), 1); // PE 1
     nvshmem_quiet();
-    
 
     // GPU 0 doesn't compute loss, but needs to set mean_loss for backward pass
     // If targets provided, set to a valid value (GPU 1 has the actual loss)
@@ -1627,12 +1625,14 @@ void gpt2_backward(GPT2 *model) {
   }
 
   // convenience shortcuts
-  int B = model->batch_size; ;
-  int T =  model->seq_len; ;
+  int B = model->batch_size;
+  ;
+  int T = model->seq_len;
+  ;
   int Vp = model->config.padded_vocab_size;
   int L = model->config.num_layers;
   int NH = model->config.num_heads;
-  int C = model->config.channels ;
+  int C = model->config.channels;
 
   // Pipeline backward pass - split between 2 GPUs
   int my_pe = nvshmem_my_pe();
@@ -1724,8 +1724,6 @@ void gpt2_backward(GPT2 *model) {
     nvshmem_putmem(model->nvshmem_grad_buffer, dresidual,
                    B * T * C * sizeof(float), 0); // PE 0
     nvshmem_quiet();
-    
-
   }
 
   // GPU 0: Backward through layers 5-0 + Embedding
@@ -1733,10 +1731,10 @@ void gpt2_backward(GPT2 *model) {
 
   if (my_pe == 0) {
     // Wait for GPU 1 to send gradients
-    
+
     cudaMemcpy(dresidual, model->nvshmem_grad_buffer, B * T * C * sizeof(float),
                cudaMemcpyDeviceToDevice);
-    
+
     // Backward through layers 5-0
     for (int l = 5; l >= 0; l--) {
       residual = (l == 0) ? acts.encoded : acts.residual3 + (l - 1) * B * T * C;
@@ -2027,8 +2025,8 @@ int main(int argc, char *argv[]) {
   const char *val_data_pattern =
       "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
   const char *output_log_file = NULL;
-  int B = 4 ;    // batch size
-  int T = 1024 ; // sequence length max
+  int B = 4;    // batch size
+  int T = 1024; // sequence length max
   float learning_rate = 3e-4f;
   int val_loss_every = 20; // every how many steps do we eval validation loss?
   int val_max_steps =
@@ -2201,7 +2199,9 @@ int main(int argc, char *argv[]) {
         val_loss += model.mean_loss;
       }
       val_loss /= val_num_batches;
-      printf("val loss %f\n", val_loss);
+      if (my_pe == 1) {
+        printf("val loss %f\n", val_loss);
+      }
       logger_log_val(&logger, step, val_loss);
     }
 
@@ -2211,41 +2211,43 @@ int main(int argc, char *argv[]) {
       for (int i = 0; i < B * T; ++i) {
         gen_tokens[i] = GPT2_EOT;
       }
-      // now sample from the model autoregressively
-      printf("generating:\n---\n");
-      for (int t = 1; t < genT; t++) {
-        // note that inference is very wasteful here because for each token
-        // we re-calculate the forward pass for all of (B,T) positions from
-        // scratch but the inference here is just for sanity checking anyway
-        // and we can maybe optimize a bit more later, with careful tests
-        gpt2_forward(&model, gen_tokens, NULL, B, T);
-        // furthermore, below we're only using b=0 (i.e. the first row) of all
-        // B rows we're in principle running B "inference streams" in parallel
-        // here only using position 0 because it's a bit faster (copy less
-        // probs from GPU -> CPU) get the V-dimensional vector probs[0, t-1,
-        // :]
-        float *logits =
-            model.acts.output + (t - 1) * model.config.padded_vocab_size;
-        // move probs back to CPU and sample (note we only move the first
-        // vocab_size logits, ignoring the padding)
-        cudaCheck(cudaMemcpy(cpu_logits, logits,
-                             model.config.vocab_size * sizeof(float),
-                             cudaMemcpyDeviceToHost));
-        float coin = random_f32(&rng_state);
-        int next_token =
-            sample_softmax(cpu_logits, model.config.vocab_size, coin);
-        gen_tokens[t] = next_token;
-        // print the generated token, either using the Tokenizer or a fallback
-        if (tokenizer.init_ok) {
-          const char *token_str = tokenizer_decode(&tokenizer, next_token);
-          safe_printf(token_str);
-        } else {
-          // fall back to printing the token id
-          printf("%d ", next_token);
+      if (my_pe == 1) {
+        // now sample from the model autoregressively
+        printf("generating:\n---\n");
+        for (int t = 1; t < genT; t++) {
+          // note that inference is very wasteful here because for each token
+          // we re-calculate the forward pass for all of (B,T) positions from
+          // scratch but the inference here is just for sanity checking anyway
+          // and we can maybe optimize a bit more later, with careful tests
+          gpt2_forward(&model, gen_tokens, NULL, B, T);
+          // furthermore, below we're only using b=0 (i.e. the first row) of all
+          // B rows we're in principle running B "inference streams" in parallel
+          // here only using position 0 because it's a bit faster (copy less
+          // probs from GPU -> CPU) get the V-dimensional vector probs[0, t-1,
+          // :]
+          float *logits =
+              model.acts.output + (t - 1) * model.config.padded_vocab_size;
+          // move probs back to CPU and sample (note we only move the first
+          // vocab_size logits, ignoring the padding)
+          cudaCheck(cudaMemcpy(cpu_logits, logits,
+                               model.config.vocab_size * sizeof(float),
+                               cudaMemcpyDeviceToHost));
+          float coin = random_f32(&rng_state);
+          int next_token =
+              sample_softmax(cpu_logits, model.config.vocab_size, coin);
+          gen_tokens[t] = next_token;
+          // print the generated token, either using the Tokenizer or a fallback
+          if (tokenizer.init_ok) {
+            const char *token_str = tokenizer_decode(&tokenizer, next_token);
+            safe_printf(token_str);
+          } else {
+            // fall back to printing the token id
+            printf("%d ", next_token);
+          }
+          fflush(stdout);
         }
-        fflush(stdout);
+        printf("\n---\n");
       }
-      printf("\n---\n");
     }
 
     // bit confusing: we want to make sure to eval and sample on 0th iteration
@@ -2272,9 +2274,9 @@ int main(int argc, char *argv[]) {
     total_sum_iteration_time_s += time_elapsed_s;
     int tokens_per_second = (B * T) / time_elapsed_s;
     if (my_pe == 1) {
-    printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1,
-           train_num_batches, model.mean_loss, time_elapsed_s * 1000,
-           tokens_per_second);
+      printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1,
+             train_num_batches, model.mean_loss, time_elapsed_s * 1000,
+             tokens_per_second);
     }
     logger_log_train(&logger, step, model.mean_loss);
   }
