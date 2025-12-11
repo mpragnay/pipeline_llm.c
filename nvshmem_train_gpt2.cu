@@ -2180,6 +2180,8 @@ int main(int argc, char *argv[]) {
   // some memory for generating samples from the model
   unsigned long long rng_state = 1337;
   int *gen_tokens = (int *)mallocCheck(B * T * sizeof(int));
+  int *d_gen_tokens; // GPU memory for gen_tokens (needed for NVSHMEM)
+  cudaCheck(cudaMalloc((void **)&d_gen_tokens, B * T * sizeof(int)));
   float *cpu_logits =
       (float *)mallocCheck(model.config.vocab_size * sizeof(float));
 
@@ -2211,6 +2213,9 @@ int main(int argc, char *argv[]) {
       for (int i = 0; i < B * T; ++i) {
         gen_tokens[i] = GPT2_EOT;
       }
+      // Copy to GPU
+      cudaCheck(cudaMemcpy(d_gen_tokens, gen_tokens, B * T * sizeof(int),
+                           cudaMemcpyHostToDevice));
 
       // Both GPUs need to participate in the forward pass (pipeline requires
       // it) But only GPU 1 does the token sampling and printing
@@ -2221,7 +2226,7 @@ int main(int argc, char *argv[]) {
       for (int t = 1; t < genT; t++) {
         // CRITICAL: Both GPUs must participate in forward pass
         // GPU 0 processes layers 0-5, GPU 1 processes layers 6-11
-        gpt2_forward(&model, gen_tokens, NULL, B, T);
+        gpt2_forward(&model, d_gen_tokens, NULL, B, T);
 
         // Only GPU 1 samples and prints tokens
         if (my_pe == 1) {
@@ -2237,6 +2242,11 @@ int main(int argc, char *argv[]) {
           int next_token =
               sample_softmax(cpu_logits, model.config.vocab_size, coin);
           gen_tokens[t] = next_token;
+
+          // Update GPU memory with the new token
+          cudaCheck(cudaMemcpy(&d_gen_tokens[t], &gen_tokens[t], sizeof(int),
+                               cudaMemcpyHostToDevice));
+
           // print the generated token, either using the Tokenizer or a fallback
           if (tokenizer.init_ok) {
             const char *token_str = tokenizer_decode(&tokenizer, next_token);
@@ -2248,11 +2258,11 @@ int main(int argc, char *argv[]) {
           fflush(stdout);
         }
 
-        // Synchronize gen_tokens across GPUs so GPU 0 has the latest tokens
-        // GPU 1 broadcasts the updated gen_tokens to GPU 0
+        // Synchronize d_gen_tokens across GPUs so GPU 0 has the latest tokens
+        // GPU 1 broadcasts the updated d_gen_tokens to GPU 0
         nvshmem_barrier_all();
         if (my_pe == 1) {
-          nvshmem_putmem(gen_tokens, gen_tokens, B * T * sizeof(int), 0);
+          nvshmem_putmem(d_gen_tokens, d_gen_tokens, B * T * sizeof(int), 0);
           nvshmem_quiet();
         }
         nvshmem_barrier_all();
@@ -2304,6 +2314,7 @@ int main(int argc, char *argv[]) {
   gpt2_free(&model);
   free(cpu_logits);
   free(gen_tokens);
+  cudaCheck(cudaFree(d_gen_tokens));
   cublasCheck(cublasDestroy(cublas_handle));
   logger_free(&logger);
 
