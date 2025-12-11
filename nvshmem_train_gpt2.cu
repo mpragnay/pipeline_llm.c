@@ -2211,20 +2211,21 @@ int main(int argc, char *argv[]) {
       for (int i = 0; i < B * T; ++i) {
         gen_tokens[i] = GPT2_EOT;
       }
+
+      // Both GPUs need to participate in the forward pass (pipeline requires
+      // it) But only GPU 1 does the token sampling and printing
       if (my_pe == 1) {
-        // now sample from the model autoregressively
         printf("generating:\n---\n");
-        for (int t = 1; t < genT; t++) {
-          // note that inference is very wasteful here because for each token
-          // we re-calculate the forward pass for all of (B,T) positions from
-          // scratch but the inference here is just for sanity checking anyway
-          // and we can maybe optimize a bit more later, with careful tests
-          gpt2_forward(&model, gen_tokens, NULL, B, T);
-          // furthermore, below we're only using b=0 (i.e. the first row) of all
-          // B rows we're in principle running B "inference streams" in parallel
-          // here only using position 0 because it's a bit faster (copy less
-          // probs from GPU -> CPU) get the V-dimensional vector probs[0, t-1,
-          // :]
+      }
+
+      for (int t = 1; t < genT; t++) {
+        // CRITICAL: Both GPUs must participate in forward pass
+        // GPU 0 processes layers 0-5, GPU 1 processes layers 6-11
+        gpt2_forward(&model, gen_tokens, NULL, B, T);
+
+        // Only GPU 1 samples and prints tokens
+        if (my_pe == 1) {
+          // Get the V-dimensional vector logits[0, t-1, :]
           float *logits =
               model.acts.output + (t - 1) * model.config.padded_vocab_size;
           // move probs back to CPU and sample (note we only move the first
@@ -2246,6 +2247,18 @@ int main(int argc, char *argv[]) {
           }
           fflush(stdout);
         }
+
+        // Synchronize gen_tokens across GPUs so GPU 0 has the latest tokens
+        // GPU 1 broadcasts the updated gen_tokens to GPU 0
+        nvshmem_barrier_all();
+        if (my_pe == 1) {
+          nvshmem_putmem(gen_tokens, gen_tokens, B * T * sizeof(int), 0);
+          nvshmem_quiet();
+        }
+        nvshmem_barrier_all();
+      }
+
+      if (my_pe == 1) {
         printf("\n---\n");
       }
     }
