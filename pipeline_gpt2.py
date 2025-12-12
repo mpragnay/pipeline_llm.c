@@ -416,7 +416,7 @@ def main():
              model.eval()
              print("generating:\n---")
              with torch.no_grad():
-                 ctx = torch.tensor([[50256]], dtype=torch.long)
+                 ctx = torch.tensor([[50256]], dtype=torch.long, device=model.dev0)
                  for t_gen in range(1, args.g):
                      logits, _ = model(ctx)
                      next_logits = logits[0, -1, :]
