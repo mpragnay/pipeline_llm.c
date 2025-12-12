@@ -329,6 +329,15 @@ nccl_pipeline_gpt2: nccl_pipeline_gpt2.cu
 		$(CUDA_OUTPUT_FILE)
 
 
+# Simple NCCL Connectivity Test
+# Run with: mpirun -np 2 ./test_nccl_simple
+test_nccl_simple: test_nccl_simple.cu
+	$(NVCC) --threads=0 -t=0 --use_fast_math -std=c++14 -O3 \
+		-arch=sm_75 \
+		-I$(OPENMPI_INCLUDE_PATH) -L$(OPENMPI_LIB_PATH) \
+		$^ -lnccl -lcuda -lcudart -lmpi \
+		$(CUDA_OUTPUT_FILE)
+
 clean:
 	$(REMOVE_FILES) $(TARGETS) test_nccl test_nvshmem nvshmem_train_gpt2 nccl_pipeline_gpt2
 	$(REMOVE_BUILD_OBJECT_FILES)
