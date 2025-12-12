@@ -2075,7 +2075,20 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // 6. Gradient Clipping (FIX: clip grads_memory, not accumulated)
+    // 6. CRITICAL: AllReduce wte gradients BEFORE clipping
+    // Stage 0 computes wte grads from encoder_backward
+    // Stage 1 computes wte grads from classifier matmul_backward
+    // Sum them FIRST, then clip the combined result
+    int Vp = stage.config.padded_vocab_size;
+    int C = stage.config.channels;
+    ncclCheck(ncclAllReduce((const void *)stage.grads.wte,
+                            (void *)stage.grads.wte, Vp * C, ncclFloat, ncclSum,
+                            stage.nccl_comm, cudaStreamDefault));
+    cudaCheck(cudaDeviceSynchronize());
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // 7. Gradient Clipping (AFTER AllReduce, clips combined gradients)
     float grad_norm =
         compute_gradient_norm(stage.grads_memory, stage.num_parameters);
     float max_grad_norm = 1.0f;
@@ -2095,19 +2108,6 @@ int main(int argc, char *argv[]) {
       printf("[Stage %d] Clipped: %.2e -> %.2e\n", rank, grad_norm,
              grad_norm_after);
     }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // 6.5 CRITICAL: AllReduce wte gradients (both stages contribute)
-    // Stage 0 computes wte grads from encoder_backward
-    // Stage 1 computes wte grads from classifier matmul_backward
-    // We must SUM them before Stage 0 updates wte
-    int Vp = stage.config.padded_vocab_size;
-    int C = stage.config.channels;
-    ncclCheck(ncclAllReduce((const void *)stage.grads.wte,
-                            (void *)stage.grads.wte, Vp * C, ncclFloat, ncclSum,
-                            stage.nccl_comm, cudaStreamDefault));
-    cudaCheck(cudaDeviceSynchronize());
 
     MPI_Barrier(MPI_COMM_WORLD);
 
