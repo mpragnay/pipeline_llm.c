@@ -1842,6 +1842,65 @@ int main(int argc, char *argv[]) {
   }
 
   MPI_Barrier(MPI_COMM_WORLD);
+
+  // 4. Backward Pass: Compute Gradients
+  if (rank == 0)
+    printf("[DEBUG] Starting backward pass...\n");
+
+  // Zero out gradients before backward pass
+  stage_zero_grad(&stage);
+
+  // Execute backward pass (reverse order: Stage 1 first, then Stage 0)
+  if (stage.pipe_config.is_last_stage) {
+    // Stage 1: Backward from loss
+    printf("[Stage %d] Executing backward pass (Last Stage)...\n", rank);
+    stage_backward(&stage, mb_idx);
+
+    // Check gradients
+    float grad_norm =
+        compute_gradient_norm(stage.grads_memory, stage.num_parameters);
+    printf("[Stage %d] Gradient norm: %.6e\n", rank, grad_norm);
+    check_tensor_debug("gradients_stage1", stage.grads_memory,
+                       stage.num_parameters, rank, true);
+
+    // Send gradients backward to Stage 0
+    if (!stage.pipe_config.is_first_stage) {
+      printf("[Stage %d] Sending gradients to Stage %d...\n", rank, rank - 1);
+      // Check what we're sending
+      check_tensor_debug("gradient_send_buffer", stage.send_buffer,
+                         stage.comm_buffer_size, rank, false);
+      ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
+                         rank - 1, stage.nccl_comm, cudaStreamDefault));
+      printf("[Stage %d] NCCL gradient send initiated.\n", rank);
+    }
+  } else {
+    // Stage 0: Receive gradients from Stage 1, then do backward
+    if (!stage.pipe_config.is_last_stage) {
+      printf("[Stage %d] Waiting to receive gradients from Stage %d...\n", rank,
+             rank + 1);
+      ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size, ncclFloat,
+                         rank + 1, stage.nccl_comm, cudaStreamDefault));
+      printf("[Stage %d] NCCL gradient recv complete.\n", rank);
+      // Check what we received
+      check_tensor_debug("gradient_recv_buffer", stage.recv_buffer,
+                         stage.comm_buffer_size, rank, false);
+    }
+
+    printf("[Stage %d] Executing backward pass (First Stage)...\n", rank);
+    stage_backward(&stage, mb_idx);
+
+    // Check gradients
+    float grad_norm =
+        compute_gradient_norm(stage.grads_memory, stage.num_parameters);
+    printf("[Stage %d] Gradient norm: %.6e\n", rank, grad_norm);
+    check_tensor_debug("gradients_stage0", stage.grads_memory,
+                       stage.num_parameters, rank, true);
+  }
+
+  cudaCheck(cudaDeviceSynchronize());
+  printf("[Stage %d] Backward pass DONE.\n", rank);
+
+  MPI_Barrier(MPI_COMM_WORLD);
   if (rank == 0)
     printf("[DEBUG] Test Complete.\n");
 
