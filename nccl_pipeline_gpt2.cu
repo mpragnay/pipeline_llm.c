@@ -1756,210 +1756,182 @@ int main(int argc, char *argv[]) {
     printf("[DEBUG] Starting training loop (%d iterations)...\n",
            num_iterations);
 
-  // Simplifed Debug Loop: Single Iteration, Single Microbatch, Forward Only
-  if (rank == 0)
-    printf("[DEBUG] Starting SIMPLIFIED forward-only test...\n");
+  // Main training loop
+  for (int iter = 0; iter < num_iterations; iter++) {
+    if (rank == 0)
+      printf("\n[DEBUG] ========== Iteration %d/%d ==========\n", iter + 1,
+             num_iterations);
 
-  // 1. Load one batch
-  if (rank == 0)
-    printf("[DEBUG] Loading batch...\n");
-  dataloader_next_batch(&train_loader);
-  cudaCheck(
-      cudaMemcpy(stage.inputs, train_loader.inputs,
-                 microbatch_size * num_microbatches * seq_len * sizeof(int),
-                 cudaMemcpyHostToDevice));
-  cudaCheck(
-      cudaMemcpy(stage.targets, train_loader.targets,
-                 microbatch_size * num_microbatches * seq_len * sizeof(int),
-                 cudaMemcpyHostToDevice));
-  cudaCheck(cudaDeviceSynchronize());
-  if (rank == 0)
-    printf("[DEBUG] Batch loaded and copied to GPU.\n");
+    // 1. Load one batch
+    if (rank == 0)
+      printf("[DEBUG] Loading batch...\n");
+    dataloader_next_batch(&train_loader);
+    cudaCheck(
+        cudaMemcpy(stage.inputs, train_loader.inputs,
+                   microbatch_size * num_microbatches * seq_len * sizeof(int),
+                   cudaMemcpyHostToDevice));
+    cudaCheck(
+        cudaMemcpy(stage.targets, train_loader.targets,
+                   microbatch_size * num_microbatches * seq_len * sizeof(int),
+                   cudaMemcpyHostToDevice));
+    cudaCheck(cudaDeviceSynchronize());
+    if (rank == 0)
+      printf("[DEBUG] Batch loaded and copied to GPU.\n");
 
-  // Barrier to ensure all ranks are ready
-  MPI_Barrier(MPI_COMM_WORLD);
+    // Barrier to ensure all ranks are ready
+    MPI_Barrier(MPI_COMM_WORLD);
 
-  // 2. Execute Forward Pass (Single Microbatch, Index 0)
-  int mb_idx = 0;
-  printf("[Stage %d] Starting forward pass for mb %d...\n", rank, mb_idx);
+    // 2. Execute Forward Pass (Single Microbatch, Index 0)
+    int mb_idx = 0;
+    printf("[Stage %d] Starting forward pass for mb %d...\n", rank, mb_idx);
 
-  if (stage.pipe_config.is_first_stage) {
-    // Stage 0: Forward -> Send
-    printf("[Stage %d] Executing forward (First Stage)...\n", rank);
-    stage_forward(&stage, mb_idx);
+    if (stage.pipe_config.is_first_stage) {
+      // Stage 0: Forward -> Send
+      printf("[Stage %d] Executing forward (First Stage)...\n", rank);
+      stage_forward(&stage, mb_idx);
 
-    if (!stage.pipe_config.is_last_stage) {
-      printf("[Stage %d] Sending activations to Stage %d...\n", rank, rank + 1);
-      // Explicit check of what we are sending
-      check_tensor_debug("send_buffer_content", stage.send_buffer,
-                         stage.comm_buffer_size, rank, false);
-      ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
-                         rank + 1, stage.nccl_comm, cudaStreamDefault));
-      printf("[Stage %d] NCCL Send initiated.\n", rank);
-    }
-  } else {
-    // Stage N: Recv -> Forward -> (Send)
-    if (!stage.pipe_config.is_first_stage) {
-      printf("[Stage %d] Waiting to receive from Stage %d...\n", rank,
-             rank - 1);
-      ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size, ncclFloat,
-                         rank - 1, stage.nccl_comm, cudaStreamDefault));
-      printf("[Stage %d] NCCL Recv complete.\n", rank);
-      // Explicit check of what we received
-      check_tensor_debug("recv_buffer_content", stage.recv_buffer,
-                         stage.comm_buffer_size, rank, false);
-    }
+      if (!stage.pipe_config.is_last_stage) {
+        printf("[Stage %d] Sending activations to Stage %d...\n", rank,
+               rank + 1);
+        // Explicit check of what we are sending
+        check_tensor_debug("send_buffer_content", stage.send_buffer,
+                           stage.comm_buffer_size, rank, false);
+        ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
+                           rank + 1, stage.nccl_comm, cudaStreamDefault));
+        printf("[Stage %d] NCCL Send initiated.\n", rank);
+      }
+    } else {
+      // Stage N: Recv -> Forward -> (Send)
+      if (!stage.pipe_config.is_first_stage) {
+        printf("[Stage %d] Waiting to receive from Stage %d...\n", rank,
+               rank - 1);
+        ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size, ncclFloat,
+                           rank - 1, stage.nccl_comm, cudaStreamDefault));
+        printf("[Stage %d] NCCL Recv complete.\n", rank);
+        // Explicit check of what we received
+        check_tensor_debug("recv_buffer_content", stage.recv_buffer,
+                           stage.comm_buffer_size, rank, false);
+      }
 
-    printf("[Stage %d] Executing forward...\n", rank);
-    stage_forward(&stage, mb_idx);
+      printf("[Stage %d] Executing forward...\n", rank);
+      stage_forward(&stage, mb_idx);
 
-    if (!stage.pipe_config.is_last_stage) {
-      // Middle stages would send here
-      ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
-                         rank + 1, stage.nccl_comm, cudaStreamDefault));
-    }
-  }
-
-  cudaCheck(cudaDeviceSynchronize());
-  printf("[Stage %d] Forward pass DONE.\n", rank);
-
-  // 3. Compute and display loss (Stage 1 only)
-  if (stage.pipe_config.is_last_stage) {
-    // Copy losses from GPU to CPU
-    cudaCheck(cudaMemcpy(stage.cpu_losses, stage.acts_microbatch[mb_idx].losses,
-                         microbatch_size * seq_len * sizeof(float),
-                         cudaMemcpyDeviceToHost));
-
-    // Compute mean loss
-    float mean_loss = 0.0f;
-    for (int i = 0; i < microbatch_size * seq_len; i++) {
-      mean_loss += stage.cpu_losses[i];
-    }
-    mean_loss /= (microbatch_size * seq_len);
-    stage.mean_loss = mean_loss;
-
-    printf("[Stage %d] Loss: %.6f\n", rank, mean_loss);
-  }
-
-  MPI_Barrier(MPI_COMM_WORLD);
-
-  // 4. Backward Pass: Compute Gradients
-  if (rank == 0)
-    printf("[DEBUG] Starting backward pass...\n");
-
-  // Zero out gradients before backward pass
-  stage_zero_grad(&stage);
-
-  // Execute backward pass (reverse order: Stage 1 first, then Stage 0)
-  if (stage.pipe_config.is_last_stage) {
-    // Stage 1: Backward from loss
-    printf("[Stage %d] Executing backward pass (Last Stage)...\n", rank);
-    stage_backward(&stage, mb_idx);
-
-    // Check gradients
-    float grad_norm =
-        compute_gradient_norm(stage.grads_memory, stage.num_parameters);
-    printf("[Stage %d] Gradient norm: %.6e\n", rank, grad_norm);
-    check_tensor_debug("gradients_stage1", stage.grads_memory,
-                       stage.num_parameters, rank, true);
-
-    // Send gradients backward to Stage 0
-    if (!stage.pipe_config.is_first_stage) {
-      printf("[Stage %d] Sending gradients to Stage %d...\n", rank, rank - 1);
-      // Check what we're sending
-      check_tensor_debug("gradient_send_buffer", stage.send_buffer,
-                         stage.comm_buffer_size, rank, false);
-      ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
-                         rank - 1, stage.nccl_comm, cudaStreamDefault));
-      printf("[Stage %d] NCCL gradient send initiated.\n", rank);
-    }
-  } else {
-    // Stage 0: Receive gradients from Stage 1, then do backward
-    if (!stage.pipe_config.is_last_stage) {
-      printf("[Stage %d] Waiting to receive gradients from Stage %d...\n", rank,
-             rank + 1);
-      ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size, ncclFloat,
-                         rank + 1, stage.nccl_comm, cudaStreamDefault));
-      printf("[Stage %d] NCCL gradient recv complete.\n", rank);
-      // Check what we received
-      check_tensor_debug("gradient_recv_buffer", stage.recv_buffer,
-                         stage.comm_buffer_size, rank, false);
+      if (!stage.pipe_config.is_last_stage) {
+        // Middle stages would send here
+        ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
+                           rank + 1, stage.nccl_comm, cudaStreamDefault));
+      }
     }
 
-    printf("[Stage %d] Executing backward pass (First Stage)...\n", rank);
-    stage_backward(&stage, mb_idx);
+    cudaCheck(cudaDeviceSynchronize());
+    printf("[Stage %d] Forward pass DONE.\n", rank);
 
-    // Check gradients
-    float grad_norm =
-        compute_gradient_norm(stage.grads_memory, stage.num_parameters);
-    printf("[Stage %d] Gradient norm: %.6e\n", rank, grad_norm);
-    check_tensor_debug("gradients_stage0", stage.grads_memory,
-                       stage.num_parameters, rank, true);
+    // 3. Compute and display loss (Stage 1 only)
+    if (stage.pipe_config.is_last_stage) {
+      // Copy losses from GPU to CPU
+      cudaCheck(cudaMemcpy(
+          stage.cpu_losses, stage.acts_microbatch[mb_idx].losses,
+          microbatch_size * seq_len * sizeof(float), cudaMemcpyDeviceToHost));
+
+      // Compute mean loss
+      float mean_loss = 0.0f;
+      for (int i = 0; i < microbatch_size * seq_len; i++) {
+        mean_loss += stage.cpu_losses[i];
+      }
+      mean_loss /= (microbatch_size * seq_len);
+      stage.mean_loss = mean_loss;
+
+      printf("[Stage %d] Iteration %d Loss: %.6f\n", rank, iter + 1, mean_loss);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // 4. Backward Pass: Compute Gradients
+    if (rank == 0)
+      printf("[DEBUG] Starting backward pass...\n");
+
+    // Zero out gradients before backward pass
+    stage_zero_grad(&stage);
+
+    // Execute backward pass (reverse order: Stage 1 first, then Stage 0)
+    if (stage.pipe_config.is_last_stage) {
+      // Stage 1: Backward from loss
+      printf("[Stage %d] Executing backward pass (Last Stage)...\n", rank);
+      stage_backward(&stage, mb_idx);
+
+      // Check gradients
+      float grad_norm =
+          compute_gradient_norm(stage.grads_memory, stage.num_parameters);
+      printf("[Stage %d] Gradient norm: %.6e\n", rank, grad_norm);
+      check_tensor_debug("gradients_stage1", stage.grads_memory,
+                         stage.num_parameters, rank, true);
+
+      // Send gradients backward to Stage 0
+      if (!stage.pipe_config.is_first_stage) {
+        printf("[Stage %d] Sending gradients to Stage %d...\n", rank, rank - 1);
+        // Check what we're sending
+        check_tensor_debug("gradient_send_buffer", stage.send_buffer,
+                           stage.comm_buffer_size, rank, false);
+        ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
+                           rank - 1, stage.nccl_comm, cudaStreamDefault));
+        printf("[Stage %d] NCCL gradient send initiated.\n", rank);
+      }
+    } else {
+      // Stage 0: Receive gradients from Stage 1, then do backward
+      if (!stage.pipe_config.is_last_stage) {
+        printf("[Stage %d] Waiting to receive gradients from Stage %d...\n",
+               rank, rank + 1);
+        ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size, ncclFloat,
+                           rank + 1, stage.nccl_comm, cudaStreamDefault));
+        printf("[Stage %d] NCCL gradient recv complete.\n", rank);
+        // Check what we received
+        check_tensor_debug("gradient_recv_buffer", stage.recv_buffer,
+                           stage.comm_buffer_size, rank, false);
+      }
+
+      printf("[Stage %d] Executing backward pass (First Stage)...\n", rank);
+      stage_backward(&stage, mb_idx);
+
+      // Check gradients
+      float grad_norm =
+          compute_gradient_norm(stage.grads_memory, stage.num_parameters);
+      printf("[Stage %d] Gradient norm: %.6e\n", rank, grad_norm);
+      check_tensor_debug("gradients_stage0", stage.grads_memory,
+                         stage.num_parameters, rank, true);
+    }
+
+    cudaCheck(cudaDeviceSynchronize());
+    printf("[Stage %d] Backward pass DONE.\n", rank);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // 5. Accumulate Gradients
+    if (rank == 0)
+      printf("[DEBUG] Accumulating gradients...\n");
+
+    stage_accumulate_gradients(&stage);
+
+    if (rank == 0)
+      printf("[DEBUG] Gradient accumulation complete.\n");
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // 6. Optimizer Update (AdamW)
+    if (rank == 0)
+      printf("[DEBUG] Updating parameters with AdamW...\n");
+
+    // Apply optimizer update
+    stage_update(&stage, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, iter + 1);
+
+    cudaCheck(cudaDeviceSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (rank == 0)
+      printf("[DEBUG] Iteration %d/%d complete.\n\n", iter + 1, num_iterations);
   }
 
-  cudaCheck(cudaDeviceSynchronize());
-  printf("[Stage %d] Backward pass DONE.\n", rank);
-
-  MPI_Barrier(MPI_COMM_WORLD);
-
-  // 5. Accumulate Gradients
   if (rank == 0)
-    printf("[DEBUG] Accumulating gradients...\n");
-
-  stage_accumulate_gradients(&stage);
-
-  if (rank == 0)
-    printf("[DEBUG] Gradient accumulation complete.\n");
-
-  MPI_Barrier(MPI_COMM_WORLD);
-
-  // 6. Optimizer Update (AdamW)
-  if (rank == 0)
-    printf("[DEBUG] Updating parameters with AdamW...\n");
-
-  // Check parameters BEFORE update
-  float param_norm_before = 0.0f;
-  for (size_t i = 0; i < min((size_t)1000, stage.num_parameters); i++) {
-    float val;
-    cudaMemcpy(&val, &stage.params_memory[i], sizeof(float),
-               cudaMemcpyDeviceToHost);
-    param_norm_before += val * val;
-  }
-  param_norm_before = sqrtf(param_norm_before);
-  printf("[Stage %d] Param norm (first 1000) BEFORE update: %.6e\n", rank,
-         param_norm_before);
-
-  // Apply optimizer update
-  int step = 1; // First step
-  stage_update(&stage, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step);
-
-  // Check parameters AFTER update
-  float param_norm_after = 0.0f;
-  for (size_t i = 0; i < min((size_t)1000, stage.num_parameters); i++) {
-    float val;
-    cudaMemcpy(&val, &stage.params_memory[i], sizeof(float),
-               cudaMemcpyDeviceToHost);
-    param_norm_after += val * val;
-  }
-  param_norm_after = sqrtf(param_norm_after);
-  printf("[Stage %d] Param norm (first 1000) AFTER update: %.6e\n", rank,
-         param_norm_after);
-
-  float param_change = fabsf(param_norm_after - param_norm_before);
-  printf("[Stage %d] Parameter change magnitude: %.6e\n", rank, param_change);
-
-  if (param_change < 1e-10) {
-    printf("[Stage %d] [WARNING] Parameters barely changed! Optimizer may not "
-           "be working.\n",
-           rank);
-  } else {
-    printf("[Stage %d] [OK] Parameters updated successfully.\n", rank);
-  }
-
-  cudaCheck(cudaDeviceSynchronize());
-  MPI_Barrier(MPI_COMM_WORLD);
-  if (rank == 0)
-    printf("[DEBUG] Test Complete.\n");
+    printf("[DEBUG] Training complete!\n");
 
   // Cleanup
   dataloader_free(&train_loader);
