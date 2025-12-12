@@ -2098,6 +2098,19 @@ int main(int argc, char *argv[]) {
 
     MPI_Barrier(MPI_COMM_WORLD);
 
+    // 6.5 CRITICAL: AllReduce wte gradients (both stages contribute)
+    // Stage 0 computes wte grads from encoder_backward
+    // Stage 1 computes wte grads from classifier matmul_backward
+    // We must SUM them before Stage 0 updates wte
+    int Vp = stage.config.padded_vocab_size;
+    int C = stage.config.channels;
+    ncclCheck(ncclAllReduce((const void *)stage.grads.wte,
+                            (void *)stage.grads.wte, Vp * C, ncclFloat, ncclSum,
+                            stage.nccl_comm, cudaStreamDefault));
+    cudaCheck(cudaDeviceSynchronize());
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
     // 7. Optimizer Update (uses grads_memory directly)
     stage_update(&stage, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, iter + 1);
     cudaCheck(cudaDeviceSynchronize());
