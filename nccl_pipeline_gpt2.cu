@@ -2094,31 +2094,6 @@ int main(int argc, char *argv[]) {
       cudaCheck(cudaMemset(stage.grads.wpe, 0, maxT * C * sizeof(float)));
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // 7. Gradient Clipping (AFTER AllReduce, clips combined gradients)
-    float grad_norm =
-        compute_gradient_norm(stage.grads_memory, stage.num_parameters);
-    float max_grad_norm = 1.0f;
-
-    if (grad_norm > max_grad_norm) {
-      float scale = max_grad_norm / grad_norm;
-      int block_size = 512;
-      int num_blocks = (stage.num_parameters + block_size - 1) / block_size;
-      gradient_clip_kernel<<<num_blocks, block_size>>>(
-          stage.grads_memory, stage.num_parameters, scale);
-      cudaCheck(cudaGetLastError());
-      cudaCheck(cudaDeviceSynchronize());
-
-      // Verify clipping worked
-      float grad_norm_after =
-          compute_gradient_norm(stage.grads_memory, stage.num_parameters);
-      printf("[Stage %d] Clipped: %.2e -> %.2e\n", rank, grad_norm,
-             grad_norm_after);
-    }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-
     // 7. Optimizer Update (uses grads_memory directly)
     stage_update(&stage, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, iter + 1);
     cudaCheck(cudaDeviceSynchronize());
@@ -2130,10 +2105,7 @@ int main(int argc, char *argv[]) {
 
     // 9. Simple logging
     if (stage.pipe_config.is_last_stage) {
-      printf("[Iter %d] Loss: %.6f | Grad norm: %.2e%s\n", iter + 1,
-             stage.mean_loss,
-             (grad_norm > max_grad_norm) ? max_grad_norm : grad_norm,
-             (grad_norm > max_grad_norm) ? " [CLIPPED]" : "");
+      printf("[Iter %d] Loss: %.6f\\n", iter + 1, stage.mean_loss);
     }
   }
 
