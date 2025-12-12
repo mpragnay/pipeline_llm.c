@@ -1587,18 +1587,18 @@ void stage_update(PipelineStage *stage, float learning_rate, float beta1,
 
     // Update each parameter tensor for this layer
     size_t param_sizes[] = {
-        C,         // ln1w
-        C,         // ln1b
-        3 * C * C, // qkvw
-        3 * C,     // qkvb
-        C * C,     // attprojw
-        C,         // attprojb
-        C,         // ln2w
-        C,         // ln2b
-        4 * C * C, // fcw
-        4 * C,     // fcb
-        C * 4 * C, // fcprojw
-        C          // fcprojb
+        (size_t)C,           // ln1w
+        (size_t)C,           // ln1b
+        (size_t)(3 * C * C), // qkvw
+        (size_t)(3 * C),     // qkvb
+        (size_t)(C * C),     // attprojw
+        (size_t)C,           // attprojb
+        (size_t)C,           // ln2w
+        (size_t)C,           // ln2b
+        (size_t)(4 * C * C), // fcw
+        (size_t)(4 * C),     // fcb
+        (size_t)(C * 4 * C), // fcprojw
+        (size_t)C            // fcprojb
     };
 
     float *param_ptrs[] = {stage->params.ln1w + global_l * C,
