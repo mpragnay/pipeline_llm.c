@@ -67,7 +67,7 @@ $(info ---------------------------------------------)
 
 ifneq ($(OS), Windows_NT)
   NVCC := $(shell which nvcc 2>/dev/null)
-  NVCC_LDFLAGS += -lnvidia-ml
+  # NVCC_LDFLAGS += -lnvidia-ml
 
   # Function to test if the compiler accepts a given flag.
   define check_and_add_flag
@@ -323,7 +323,7 @@ nvshmem_train_gpt2_partitioned: nvshmem_train_gpt2_partitioned.cu
 # Run with: mpirun -np 2 ./nccl_pipeline_gpt2 --batch_size 4 --num_microbatches 4 --seq_len 256
 nccl_pipeline_gpt2: nccl_pipeline_gpt2.cu
 	$(NVCC) --threads=0 -t=0 --use_fast_math -std=c++14 -O3 \
-		-arch=sm_80 \
+		-arch=sm_75 \
 		-I$(OPENMPI_INCLUDE_PATH) -L$(OPENMPI_LIB_PATH) \
 		$^ -lnccl -lcublas -lcublasLt -lcuda -lcudart -lnvidia-ml -lmpi \
 		$(CUDA_OUTPUT_FILE)
