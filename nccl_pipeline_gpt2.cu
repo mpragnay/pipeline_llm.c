@@ -1901,6 +1901,63 @@ int main(int argc, char *argv[]) {
   printf("[Stage %d] Backward pass DONE.\n", rank);
 
   MPI_Barrier(MPI_COMM_WORLD);
+
+  // 5. Accumulate Gradients
+  if (rank == 0)
+    printf("[DEBUG] Accumulating gradients...\n");
+
+  stage_accumulate_gradients(&stage);
+
+  if (rank == 0)
+    printf("[DEBUG] Gradient accumulation complete.\n");
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  // 6. Optimizer Update (AdamW)
+  if (rank == 0)
+    printf("[DEBUG] Updating parameters with AdamW...\n");
+
+  // Check parameters BEFORE update
+  float param_norm_before = 0.0f;
+  for (size_t i = 0; i < min((size_t)1000, stage.num_parameters); i++) {
+    float val;
+    cudaMemcpy(&val, &stage.params_memory[i], sizeof(float),
+               cudaMemcpyDeviceToHost);
+    param_norm_before += val * val;
+  }
+  param_norm_before = sqrtf(param_norm_before);
+  printf("[Stage %d] Param norm (first 1000) BEFORE update: %.6e\n", rank,
+         param_norm_before);
+
+  // Apply optimizer update
+  int step = 1; // First step
+  stage_update(&stage, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step);
+
+  // Check parameters AFTER update
+  float param_norm_after = 0.0f;
+  for (size_t i = 0; i < min((size_t)1000, stage.num_parameters); i++) {
+    float val;
+    cudaMemcpy(&val, &stage.params_memory[i], sizeof(float),
+               cudaMemcpyDeviceToHost);
+    param_norm_after += val * val;
+  }
+  param_norm_after = sqrtf(param_norm_after);
+  printf("[Stage %d] Param norm (first 1000) AFTER update: %.6e\n", rank,
+         param_norm_after);
+
+  float param_change = fabsf(param_norm_after - param_norm_before);
+  printf("[Stage %d] Parameter change magnitude: %.6e\n", rank, param_change);
+
+  if (param_change < 1e-10) {
+    printf("[Stage %d] [WARNING] Parameters barely changed! Optimizer may not "
+           "be working.\n",
+           rank);
+  } else {
+    printf("[Stage %d] [OK] Parameters updated successfully.\n", rank);
+  }
+
+  cudaCheck(cudaDeviceSynchronize());
+  MPI_Barrier(MPI_COMM_WORLD);
   if (rank == 0)
     printf("[DEBUG] Test Complete.\n");
 
