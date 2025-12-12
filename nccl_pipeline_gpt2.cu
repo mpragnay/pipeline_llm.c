@@ -119,6 +119,247 @@ void init_pipeline_config(PipelineConfig *config, int stage_id, int num_stages,
 }
 
 // ----------------------------------------------------------------------------
+// GPT-2 model definition and helpers moved here to resolve forward declaration
+// issues
+
+// ----------------------------------------------------------------------------
+// Struct definitions moved to top
+
+typedef struct {
+  int max_seq_len;
+  int vocab_size;
+  int padded_vocab_size;
+  int num_layers;
+  int num_heads;
+  int channels;
+} GPT2Config;
+
+#define NUM_PARAMETER_TENSORS 16
+typedef struct {
+  float *wte;      // (V, C)
+  float *wpe;      // (maxT, C)
+  float *ln1w;     // (L, C)
+  float *ln1b;     // (L, C)
+  float *qkvw;     // (L, 3*C, C)
+  float *qkvb;     // (L, 3*C)
+  float *attprojw; // (L, C, C)
+  float *attprojb; // (L, C)
+  float *ln2w;     // (L, C)
+  float *ln2b;     // (L, C)
+  float *fcw;      // (L, 4*C, C)
+  float *fcb;      // (L, 4*C)
+  float *fcprojw;  // (L, C, 4*C)
+  float *fcprojb;  // (L, C)
+  float *lnfw;     // (C)
+  float *lnfb;     // (C)
+} ParameterTensors;
+
+void fill_in_parameter_sizes(size_t *param_sizes, GPT2Config config) {
+  int Vp = config.padded_vocab_size;
+  int C = config.channels;
+  int maxT = config.max_seq_len;
+  int L = config.num_layers;
+  param_sizes[0] = Vp * C;           // wte
+  param_sizes[1] = maxT * C;         // wpe
+  param_sizes[2] = L * C;            // ln1w
+  param_sizes[3] = L * C;            // ln1b
+  param_sizes[4] = L * (3 * C) * C;  // qkvw
+  param_sizes[5] = L * (3 * C);      // qkvb
+  param_sizes[6] = L * C * C;        // attprojw
+  param_sizes[7] = L * C;            // attprojb
+  param_sizes[8] = L * C;            // ln2w
+  param_sizes[9] = L * C;            // ln2b
+  param_sizes[10] = L * (4 * C) * C; // fcw
+  param_sizes[11] = L * (4 * C);     // fcb
+  param_sizes[12] = L * C * (4 * C); // fcprojw
+  param_sizes[13] = L * C;           // fcprojb
+  param_sizes[14] = C;               // lnfw
+  param_sizes[15] = C;               // lnfb
+}
+
+float *malloc_and_point_parameters(ParameterTensors *params,
+                                   size_t *param_sizes, int on_device) {
+  size_t num_parameters = 0;
+  for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+    num_parameters += param_sizes[i];
+  }
+  float *params_memory;
+  if (on_device) {
+    cudaCheck(
+        cudaMalloc((void **)&params_memory, num_parameters * sizeof(float)));
+  } else {
+    params_memory = (float *)mallocCheck(num_parameters * sizeof(float));
+  }
+  float **ptrs[] = {
+      &params->wte,     &params->wpe,     &params->ln1w,     &params->ln1b,
+      &params->qkvw,    &params->qkvb,    &params->attprojw, &params->attprojb,
+      &params->ln2w,    &params->ln2b,    &params->fcw,      &params->fcb,
+      &params->fcprojw, &params->fcprojb, &params->lnfw,     &params->lnfb};
+  float *params_memory_iterator = params_memory;
+  for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+    *(ptrs[i]) = params_memory_iterator;
+    params_memory_iterator += param_sizes[i];
+  }
+  return params_memory;
+}
+
+#define NUM_ACTIVATION_TENSORS 21
+typedef struct {
+  float *encoded;   // (B, T, C)
+  float *ln1;       // (L, B, T, C)
+  float *ln1_mean;  // (L, B, T)
+  float *ln1_rstd;  // (L, B, T)
+  float *atty;      // (L, B, T, C)
+  float *att;       // (L, B, NH, T, T)
+  float *attproj;   // (L, B, T, C)
+  float *residual2; // (L, B, T, C)
+  float *ln2;       // (L, B, T, C)
+  float *ln2_mean;  // (L, B, T)
+  float *ln2_rstd;  // (L, B, T)
+  float *fch;       // (L, B, T, 4*C)
+  float *fch_gelu;  // (L, B, T, 4*C)
+  float *fcproj;    // (L, B, T, C)
+  float *residual3; // (L, B, T, C)
+  float *lnf;       // (B, T, C)
+  float *lnf_mean;  // (B, T)
+  float *lnf_rstd;  // (B, T)
+  float *losses;    // (B, T)
+  float *qkvr;      // (L, B, T, 3*C)
+  float *output;    // Scratchpad buffer
+} ActivationTensors;
+
+void fill_in_activation_sizes(size_t *act_sizes, int B, int T,
+                              GPT2Config config, int num_layers_local) {
+  size_t Vp = config.padded_vocab_size;
+  size_t L = num_layers_local; // Use local layer count for this stage
+  size_t NH = config.num_heads;
+  size_t C = config.channels;
+  act_sizes[0] = B * T * C;          // encoded
+  act_sizes[1] = L * B * T * C;      // ln1
+  act_sizes[2] = L * B * T;          // ln1_mean
+  act_sizes[3] = L * B * T;          // ln1_rstd
+  act_sizes[4] = L * B * T * C;      // atty
+  act_sizes[5] = L * B * NH * T * T; // att
+  act_sizes[6] = L * B * T * C;      // attproj
+  act_sizes[7] = L * B * T * C;      // residual2
+  act_sizes[8] = L * B * T * C;      // ln2
+  act_sizes[9] = L * B * T;          // ln2_mean
+  act_sizes[10] = L * B * T;         // ln2_rstd
+  act_sizes[11] = L * B * T * 4 * C; // fch
+  act_sizes[12] = L * B * T * 4 * C; // fch_gelu
+  act_sizes[13] = L * B * T * C;     // fcproj
+  act_sizes[14] = L * B * T * C;     // residual3
+  act_sizes[15] = B * T * C;         // lnf
+  act_sizes[16] = B * T;             // lnf_mean
+  act_sizes[17] = B * T;             // lnf_rstd
+  act_sizes[18] = B * T;             // losses
+  act_sizes[19] = L * B * T * 3 * C; // qkvr
+  act_sizes[20] = B * T *
+                  (3 * C > (NH * T > Vp ? NH * T : Vp)
+                       ? 3 * C
+                       : (NH * T > Vp ? NH * T : Vp)); // output
+}
+
+#define NUM_BACKWARD_TENSORS 3
+typedef struct {
+  float *bt4c;      // (B, T, 4*C)
+  float *preatt;    // (B, NH, T, T)
+  float *residual3; // (B, T, C)
+} GradActTensors;
+
+void fill_in_grad_act_sizes(size_t *act_sizes, int B, int T,
+                            GPT2Config config) {
+  size_t NH = config.num_heads;
+  size_t C = config.channels;
+  act_sizes[0] = B * T * 4 * C;  // bt4c
+  act_sizes[1] = B * NH * T * T; // preatt
+  act_sizes[2] = B * T * C;      // residual3
+}
+
+float *malloc_and_point(float **targets[], const size_t *act_sizes, int n) {
+  size_t num_activations = 0;
+  for (size_t i = 0; i < n; i++) {
+    num_activations += act_sizes[i];
+  }
+  float *acts_memory;
+  cudaCheck(cudaMalloc((void **)&acts_memory, num_activations * sizeof(float)));
+  float *acts_memory_iterator = acts_memory;
+  for (size_t i = 0; i < n; i++) {
+    *(targets[i]) = acts_memory_iterator;
+    acts_memory_iterator += act_sizes[i];
+  }
+  return acts_memory;
+}
+
+float *malloc_and_point_activations(ActivationTensors *acts,
+                                    const size_t *act_sizes) {
+  float **ptrs[] = {&acts->encoded,  &acts->ln1,       &acts->ln1_mean,
+                    &acts->ln1_rstd, &acts->atty,      &acts->att,
+                    &acts->attproj,  &acts->residual2, &acts->ln2,
+                    &acts->ln2_mean, &acts->ln2_rstd,  &acts->fch,
+                    &acts->fch_gelu, &acts->fcproj,    &acts->residual3,
+                    &acts->lnf,      &acts->lnf_mean,  &acts->lnf_rstd,
+                    &acts->losses,   &acts->qkvr,      &acts->output};
+  return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
+}
+
+float *malloc_and_point_backward(GradActTensors *acts,
+                                 const size_t *act_sizes) {
+  float **ptrs[] = {&acts->bt4c, &acts->preatt, &acts->residual3};
+  return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
+}
+
+// Main structure for a pipeline stage
+typedef struct {
+  GPT2Config config;
+  PipelineConfig pipe_config;
+
+  // Model parameters (full model loaded on all stages)
+  ParameterTensors params;
+  size_t param_sizes[NUM_PARAMETER_TENSORS];
+  float *params_memory;
+  size_t num_parameters;
+
+  // Gradients (full model)
+  ParameterTensors grads;
+  float *grads_memory;
+
+  // Accumulated gradients across microbatches
+  ParameterTensors grads_accumulated;
+  float *grads_accumulated_memory;
+
+  // Optimizer state
+  float *m_memory;
+  float *v_memory;
+
+  // Activations for each microbatch (circular buffer)
+  ActivationTensors *acts_microbatch; // Array of activation tensors
+  float **acts_memory_microbatch;     // Array of memory pointers
+  size_t act_sizes[NUM_ACTIVATION_TENSORS];
+  size_t num_activations;
+
+  // Activation gradients
+  GradActTensors grads_acts;
+  float *grads_acts_memory;
+  size_t grad_act_sizes[NUM_BACKWARD_TENSORS];
+
+  // Pipeline communication
+  ncclComm_t nccl_comm;
+  float *send_buffer;
+  float *recv_buffer;
+  size_t comm_buffer_size; // Size in elements (floats)
+
+  // Input/Output data (for first/last stages)
+  int *inputs;  // (B, T)
+  int *targets; // (B, T)
+  float *cpu_losses;
+
+  // Current iteration state
+  int current_mb; // Current microbatch being processed
+  float mean_loss;
+} PipelineStage;
+
+// ----------------------------------------------------------------------------
 // All the CUDA kernels (copied from train_gpt2_fp32.cu)
 
 __device__ inline float4 add_float4(const float4 &a, const float4 &b) {
@@ -882,247 +1123,6 @@ void stage_accumulate_gradients(PipelineStage *stage) {
   check_tensor_debug("grads_accumulated", stage->grads_accumulated_memory,
                      stage->num_parameters, stage->pipe_config.stage_id, false);
 }
-
-// ----------------------------------------------------------------------------
-// GPT-2 model definition
-
-typedef struct {
-  int max_seq_len;
-  int vocab_size;
-  int padded_vocab_size;
-  int num_layers;
-  int num_heads;
-  int channels;
-} GPT2Config;
-
-#define NUM_PARAMETER_TENSORS 16
-typedef struct {
-  float *wte;      // (V, C)
-  float *wpe;      // (maxT, C)
-  float *ln1w;     // (L, C)
-  float *ln1b;     // (L, C)
-  float *qkvw;     // (L, 3*C, C)
-  float *qkvb;     // (L, 3*C)
-  float *attprojw; // (L, C, C)
-  float *attprojb; // (L, C)
-  float *ln2w;     // (L, C)
-  float *ln2b;     // (L, C)
-  float *fcw;      // (L, 4*C, C)
-  float *fcb;      // (L, 4*C)
-  float *fcprojw;  // (L, C, 4*C)
-  float *fcprojb;  // (L, C)
-  float *lnfw;     // (C)
-  float *lnfb;     // (C)
-} ParameterTensors;
-
-void fill_in_parameter_sizes(size_t *param_sizes, GPT2Config config) {
-  int Vp = config.padded_vocab_size;
-  int C = config.channels;
-  int maxT = config.max_seq_len;
-  int L = config.num_layers;
-  param_sizes[0] = Vp * C;           // wte
-  param_sizes[1] = maxT * C;         // wpe
-  param_sizes[2] = L * C;            // ln1w
-  param_sizes[3] = L * C;            // ln1b
-  param_sizes[4] = L * (3 * C) * C;  // qkvw
-  param_sizes[5] = L * (3 * C);      // qkvb
-  param_sizes[6] = L * C * C;        // attprojw
-  param_sizes[7] = L * C;            // attprojb
-  param_sizes[8] = L * C;            // ln2w
-  param_sizes[9] = L * C;            // ln2b
-  param_sizes[10] = L * (4 * C) * C; // fcw
-  param_sizes[11] = L * (4 * C);     // fcb
-  param_sizes[12] = L * C * (4 * C); // fcprojw
-  param_sizes[13] = L * C;           // fcprojb
-  param_sizes[14] = C;               // lnfw
-  param_sizes[15] = C;               // lnfb
-}
-
-float *malloc_and_point_parameters(ParameterTensors *params,
-                                   size_t *param_sizes, int on_device) {
-  size_t num_parameters = 0;
-  for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-    num_parameters += param_sizes[i];
-  }
-  float *params_memory;
-  if (on_device) {
-    cudaCheck(
-        cudaMalloc((void **)&params_memory, num_parameters * sizeof(float)));
-  } else {
-    params_memory = (float *)mallocCheck(num_parameters * sizeof(float));
-  }
-  float **ptrs[] = {
-      &params->wte,     &params->wpe,     &params->ln1w,     &params->ln1b,
-      &params->qkvw,    &params->qkvb,    &params->attprojw, &params->attprojb,
-      &params->ln2w,    &params->ln2b,    &params->fcw,      &params->fcb,
-      &params->fcprojw, &params->fcprojb, &params->lnfw,     &params->lnfb};
-  float *params_memory_iterator = params_memory;
-  for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-    *(ptrs[i]) = params_memory_iterator;
-    params_memory_iterator += param_sizes[i];
-  }
-  return params_memory;
-}
-
-#define NUM_ACTIVATION_TENSORS 21
-typedef struct {
-  float *encoded;   // (B, T, C)
-  float *ln1;       // (L, B, T, C)
-  float *ln1_mean;  // (L, B, T)
-  float *ln1_rstd;  // (L, B, T)
-  float *atty;      // (L, B, T, C)
-  float *att;       // (L, B, NH, T, T)
-  float *attproj;   // (L, B, T, C)
-  float *residual2; // (L, B, T, C)
-  float *ln2;       // (L, B, T, C)
-  float *ln2_mean;  // (L, B, T)
-  float *ln2_rstd;  // (L, B, T)
-  float *fch;       // (L, B, T, 4*C)
-  float *fch_gelu;  // (L, B, T, 4*C)
-  float *fcproj;    // (L, B, T, C)
-  float *residual3; // (L, B, T, C)
-  float *lnf;       // (B, T, C)
-  float *lnf_mean;  // (B, T)
-  float *lnf_rstd;  // (B, T)
-  float *losses;    // (B, T)
-  float *qkvr;      // (L, B, T, 3*C)
-  float *output;    // Scratchpad buffer
-} ActivationTensors;
-
-void fill_in_activation_sizes(size_t *act_sizes, int B, int T,
-                              GPT2Config config, int num_layers_local) {
-  size_t Vp = config.padded_vocab_size;
-  size_t L = num_layers_local; // Use local layer count for this stage
-  size_t NH = config.num_heads;
-  size_t C = config.channels;
-  act_sizes[0] = B * T * C;          // encoded
-  act_sizes[1] = L * B * T * C;      // ln1
-  act_sizes[2] = L * B * T;          // ln1_mean
-  act_sizes[3] = L * B * T;          // ln1_rstd
-  act_sizes[4] = L * B * T * C;      // atty
-  act_sizes[5] = L * B * NH * T * T; // att
-  act_sizes[6] = L * B * T * C;      // attproj
-  act_sizes[7] = L * B * T * C;      // residual2
-  act_sizes[8] = L * B * T * C;      // ln2
-  act_sizes[9] = L * B * T;          // ln2_mean
-  act_sizes[10] = L * B * T;         // ln2_rstd
-  act_sizes[11] = L * B * T * 4 * C; // fch
-  act_sizes[12] = L * B * T * 4 * C; // fch_gelu
-  act_sizes[13] = L * B * T * C;     // fcproj
-  act_sizes[14] = L * B * T * C;     // residual3
-  act_sizes[15] = B * T * C;         // lnf
-  act_sizes[16] = B * T;             // lnf_mean
-  act_sizes[17] = B * T;             // lnf_rstd
-  act_sizes[18] = B * T;             // losses
-  act_sizes[19] = L * B * T * 3 * C; // qkvr
-  act_sizes[20] = B * T *
-                  (3 * C > (NH * T > Vp ? NH * T : Vp)
-                       ? 3 * C
-                       : (NH * T > Vp ? NH * T : Vp)); // output
-}
-
-#define NUM_BACKWARD_TENSORS 3
-typedef struct {
-  float *bt4c;      // (B, T, 4*C)
-  float *preatt;    // (B, NH, T, T)
-  float *residual3; // (B, T, C)
-} GradActTensors;
-
-void fill_in_grad_act_sizes(size_t *act_sizes, int B, int T,
-                            GPT2Config config) {
-  size_t NH = config.num_heads;
-  size_t C = config.channels;
-  act_sizes[0] = B * T * 4 * C;  // bt4c
-  act_sizes[1] = B * NH * T * T; // preatt
-  act_sizes[2] = B * T * C;      // residual3
-}
-
-float *malloc_and_point(float **targets[], const size_t *act_sizes, int n) {
-  size_t num_activations = 0;
-  for (size_t i = 0; i < n; i++) {
-    num_activations += act_sizes[i];
-  }
-  float *acts_memory;
-  cudaCheck(cudaMalloc((void **)&acts_memory, num_activations * sizeof(float)));
-  float *acts_memory_iterator = acts_memory;
-  for (size_t i = 0; i < n; i++) {
-    *(targets[i]) = acts_memory_iterator;
-    acts_memory_iterator += act_sizes[i];
-  }
-  return acts_memory;
-}
-
-float *malloc_and_point_activations(ActivationTensors *acts,
-                                    const size_t *act_sizes) {
-  float **ptrs[] = {&acts->encoded,  &acts->ln1,       &acts->ln1_mean,
-                    &acts->ln1_rstd, &acts->atty,      &acts->att,
-                    &acts->attproj,  &acts->residual2, &acts->ln2,
-                    &acts->ln2_mean, &acts->ln2_rstd,  &acts->fch,
-                    &acts->fch_gelu, &acts->fcproj,    &acts->residual3,
-                    &acts->lnf,      &acts->lnf_mean,  &acts->lnf_rstd,
-                    &acts->losses,   &acts->qkvr,      &acts->output};
-  return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
-}
-
-float *malloc_and_point_backward(GradActTensors *acts,
-                                 const size_t *act_sizes) {
-  float **ptrs[] = {&acts->bt4c, &acts->preatt, &acts->residual3};
-  return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
-}
-
-// Main structure for a pipeline stage
-typedef struct {
-  GPT2Config config;
-  PipelineConfig pipe_config;
-
-  // Model parameters (full model loaded on all stages)
-  ParameterTensors params;
-  size_t param_sizes[NUM_PARAMETER_TENSORS];
-  float *params_memory;
-  size_t num_parameters;
-
-  // Gradients (full model)
-  ParameterTensors grads;
-  float *grads_memory;
-
-  // Accumulated gradients across microbatches
-  ParameterTensors grads_accumulated;
-  float *grads_accumulated_memory;
-
-  // Optimizer state
-  float *m_memory;
-  float *v_memory;
-
-  // Activations for each microbatch (circular buffer)
-  ActivationTensors *acts_microbatch; // Array of activation tensors
-  float **acts_memory_microbatch;     // Array of memory pointers
-  size_t act_sizes[NUM_ACTIVATION_TENSORS];
-  size_t num_activations;
-
-  // Gradient activations
-  GradActTensors grads_acts;
-  float *grads_acts_memory;
-  size_t num_grad_acts;
-
-  // Communication buffers
-  float *send_buffer; // Buffer for sending activations/gradients
-  float *recv_buffer; // Buffer for receiving activations/gradients
-  size_t comm_buffer_size;
-
-  // NCCL communicator
-  ncclComm_t nccl_comm;
-
-  // Inputs/targets
-  int *inputs;
-  int *targets;
-  float *cpu_losses;
-
-  // Current iteration state
-  int current_mb; // Current microbatch being processed
-  float mean_loss;
-} PipelineStage;
-
-// Remaining implementation continued in next part...
 
 // ----------------------------------------------------------------------------
 // Pipeline Stage Functions
