@@ -102,22 +102,20 @@ class PipelineGPT2(nn.Module):
         self.dev1 = torch.device('cuda:1' if torch.cuda.device_count() > 1 else 'cuda:0' if torch.cuda.is_available() else 'cpu')
 
         # Model Components
-        # Use padded_vocab_size for embedding to match C behavior if present
         vocab_size_actual = config.padded_vocab_size
+        C = config.n_embd
         
         # Stage 1
-        self.wte = nn.Embedding(vocab_size_actual, config.n_embd).to(self.dev0)
-        self.wpe = nn.Embedding(config.block_size, config.n_embd).to(self.dev0)
+        self.wte = nn.Embedding(vocab_size_actual, C).to(self.dev0)
+        self.wpe = nn.Embedding(config.block_size, C).to(self.dev0)
         
         self.split_layer = config.n_layer // 2
         self.blocks_part1 = nn.ModuleList([Block(config) for _ in range(self.split_layer)]).to(self.dev0)
         
         # Stage 2
         self.blocks_part2 = nn.ModuleList([Block(config) for _ in range(self.split_layer, config.n_layer)]).to(self.dev1)
-        self.ln_f = LayerNorm(config.n_embd, bias=config.bias).to(self.dev1)
-        self.lm_head = nn.Linear(config.n_embd, vocab_size_actual, bias=False).to(self.dev1)
-        
-        # Weights will be overwritten by load_from_binary
+        self.ln_f = LayerNorm(C, bias=config.bias).to(self.dev1)
+        self.lm_head = nn.Linear(C, vocab_size_actual, bias=False).to(self.dev1)
         
         if checkpoint_path:
             self.load_from_binary(checkpoint_path)
@@ -163,6 +161,14 @@ class PipelineGPT2(nn.Module):
             assert C == self.config.n_embd
             assert NH == self.config.n_head
 
+            # Resize if needed
+            if Vp != self.config.padded_vocab_size:
+                print(f"Resize vocab_size from {self.config.padded_vocab_size} to {Vp}")
+                self.config.padded_vocab_size = Vp
+                self.config.vocab_size = V
+                self.wte = nn.Embedding(Vp, C).to(self.dev0)
+                self.lm_head = nn.Linear(C, Vp, bias=False).to(self.dev1)
+
             def read_tensor(shape):
                 numel = int(np.prod(shape))
                 bytes_to_read = numel * 4
@@ -180,19 +186,6 @@ class PipelineGPT2(nn.Module):
             wpe_data = read_tensor((maxT, C))
             with torch.no_grad():
                 self.wpe.weight.copy_(wpe_data.to(self.dev0))
-
-            # Helper for block weights
-            def set_layer_param(tensor_data, layer_idx, submodule, param_name):
-                t = tensor_data[layer_idx]
-                dev = self.dev0 if layer_idx < self.split_layer else self.dev1
-                blocks = self.blocks_part1 if layer_idx < self.split_layer else self.blocks_part2
-                actual_idx = layer_idx if layer_idx < self.split_layer else layer_idx - self.split_layer
-                
-                module = getattr(blocks[actual_idx], submodule)
-                param = getattr(module, param_name)
-                
-                with torch.no_grad():
-                    param.copy_(t.to(dev))
 
             # Read all big tensors first
             ln1w = read_tensor((L, C))
