@@ -1822,6 +1822,25 @@ int main(int argc, char *argv[]) {
 
   cudaCheck(cudaDeviceSynchronize());
   printf("[Stage %d] Forward pass DONE.\n", rank);
+
+  // 3. Compute and display loss (Stage 1 only)
+  if (stage.pipe_config.is_last_stage) {
+    // Copy losses from GPU to CPU
+    cudaCheck(cudaMemcpy(stage.cpu_losses, stage.acts_microbatch[mb_idx].losses,
+                         microbatch_size * seq_len * sizeof(float),
+                         cudaMemcpyDeviceToHost));
+
+    // Compute mean loss
+    float mean_loss = 0.0f;
+    for (int i = 0; i < microbatch_size * seq_len; i++) {
+      mean_loss += stage.cpu_losses[i];
+    }
+    mean_loss /= (microbatch_size * seq_len);
+    stage.mean_loss = mean_loss;
+
+    printf("[Stage %d] Loss: %.6f\n", rank, mean_loss);
+  }
+
   MPI_Barrier(MPI_COMM_WORLD);
   if (rank == 0)
     printf("[DEBUG] Test Complete.\n");
