@@ -20,7 +20,6 @@ Each GPU only holds its assigned layers' parameters and activations.
 #include <cuda_runtime.h>
 // NVSHMEM for multi-GPU communication
 #include <mpi.h>
-#include <nccl.h>
 #include <nvshmem.h>
 #include <nvshmemx.h>
 // our own utilities
@@ -51,15 +50,6 @@ void cublasCheck(cublasStatus_t status, const char *file, int line) {
   }
 }
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
-
-void ncclCheck(ncclResult_t status, const char *file, int line) {
-  if (status != ncclSuccess) {
-    printf("[NCCL ERROR] at file %s:%d:\n%s\n", file, line,
-           ncclGetErrorString(status));
-    exit(EXIT_FAILURE);
-  }
-}
-#define ncclCheck(err) (ncclCheck(err, __FILE__, __LINE__))
 
 static cublasComputeType_t cublas_compute_type;
 cublasHandle_t cublas_handle;
@@ -95,6 +85,14 @@ void get_partition_for_pe(PipelinePartition* part, int my_pe, int n_pes, int tot
 
 // ----------------------------------------------------------------------------
 // all the kernels
+
+// Kernel for accumulating gradients on GPU (used in NVSHMEM allreduce)
+__global__ void accumulate_grads_kernel(float *dst, const float *src, size_t n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    dst[idx] += src[idx];
+  }
+}
 
 __device__ inline float4 add_float4(const float4 &a, const float4 &b) {
   return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
@@ -1035,7 +1033,8 @@ typedef struct {
   float *nvshmem_act_buffer;
   float *nvshmem_grad_buffer;
   size_t nvshmem_buffer_size;
-  ncclComm_t nccl_comm;
+  float *nvshmem_wte_grad_buffer;  // symmetric buffer for wte gradient allreduce
+  int *nvshmem_token_buffer;       // symmetric buffer for token broadcast
 } GPT2;
 
 void gpt2_build_from_checkpoint_partitioned(GPT2 *model, const char *checkpoint_path,
@@ -1191,9 +1190,11 @@ void gpt2_build_from_checkpoint_partitioned(GPT2 *model, const char *checkpoint_
 
 void gpt2_allocate_nvshmem_buffers(GPT2 *model) {
   int my_pe = nvshmem_my_pe();
+  int n_pes = nvshmem_n_pes();
   int B = model->batch_size;
   int T = model->seq_len;
   int C = model->config.channels;
+  int Vp = model->config.padded_vocab_size;
 
   size_t buffer_elements = B * T * C;
   model->nvshmem_buffer_size = buffer_elements * sizeof(float);
@@ -1201,16 +1202,25 @@ void gpt2_allocate_nvshmem_buffers(GPT2 *model) {
   model->nvshmem_act_buffer = (float *)nvshmem_malloc(model->nvshmem_buffer_size);
   model->nvshmem_grad_buffer = (float *)nvshmem_malloc(model->nvshmem_buffer_size);
 
-  if (model->nvshmem_act_buffer == NULL || model->nvshmem_grad_buffer == NULL) {
+  // Allocate symmetric buffer for wte gradient allreduce (needs space for all PEs' contributions)
+  size_t wte_grad_size = (size_t)Vp * C * sizeof(float);
+  model->nvshmem_wte_grad_buffer = (float *)nvshmem_malloc(wte_grad_size * n_pes);
+
+  // Allocate symmetric buffer for token broadcast during generation
+  model->nvshmem_token_buffer = (int *)nvshmem_malloc(sizeof(int));
+
+  if (model->nvshmem_act_buffer == NULL || model->nvshmem_grad_buffer == NULL ||
+      model->nvshmem_wte_grad_buffer == NULL || model->nvshmem_token_buffer == NULL) {
     printf("[PE %d] Error: Failed to allocate NVSHMEM buffers\n", my_pe);
     exit(EXIT_FAILURE);
   }
 
   printf("[PE %d] allocated %zu MiB for NVSHMEM buffers\n", my_pe,
-         (2 * model->nvshmem_buffer_size) >> 20);
+         (2 * model->nvshmem_buffer_size + wte_grad_size * n_pes) >> 20);
 
   cudaCheck(cudaMemset(model->nvshmem_act_buffer, 0, model->nvshmem_buffer_size));
   cudaCheck(cudaMemset(model->nvshmem_grad_buffer, 0, model->nvshmem_buffer_size));
+  cudaCheck(cudaMemset(model->nvshmem_wte_grad_buffer, 0, wte_grad_size * n_pes));
 }
 
 void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
@@ -1523,10 +1533,33 @@ void gpt2_backward(GPT2 *model) {
     nvshmem_barrier_all();
   }
 
-  // All-reduce wte gradients
-  ncclCheck(ncclAllReduce((const void *)grads.wte, (void *)grads.wte, Vp * C,
-                          ncclFloat, ncclSum, model->nccl_comm, 0));
+  // All-reduce wte gradients using NVSHMEM
+  // Each PE puts its wte gradients to PE 0's buffer at its offset
+  size_t wte_size = (size_t)Vp * C;
 
+  cudaCheck(cudaDeviceSynchronize());
+
+  // Each PE sends its grads.wte to PE 0's buffer at offset my_pe * wte_size
+  nvshmem_float_put(model->nvshmem_wte_grad_buffer + my_pe * wte_size,
+                    grads.wte, wte_size, 0);
+  nvshmem_barrier_all();
+
+  // PE 0 reduces all contributions using GPU kernel
+  if (my_pe == 0) {
+    int block_size = 256;
+    int num_blocks = CEIL_DIV(wte_size, block_size);
+    for (int pe = 1; pe < n_pes; pe++) {
+      float *src = model->nvshmem_wte_grad_buffer + pe * wte_size;
+      accumulate_grads_kernel<<<num_blocks, block_size>>>(
+          model->nvshmem_wte_grad_buffer, src, wte_size);
+    }
+    cudaCheck(cudaGetLastError());
+    cudaCheck(cudaDeviceSynchronize());
+  }
+  nvshmem_barrier_all();
+
+  // Broadcast the reduced result from PE 0 to all PEs
+  nvshmem_float_get(grads.wte, model->nvshmem_wte_grad_buffer, wte_size, 0);
   nvshmem_barrier_all();
 }
 
@@ -1563,7 +1596,11 @@ void gpt2_free(GPT2 *model) {
   cudaCheck(cudaFree(model->inputs));
   cudaCheck(cudaFree(model->targets));
   cudaFreeHost(model->cpu_losses);
-  ncclCommDestroy(model->nccl_comm);
+  // Free NVSHMEM buffers
+  nvshmem_free(model->nvshmem_act_buffer);
+  nvshmem_free(model->nvshmem_grad_buffer);
+  nvshmem_free(model->nvshmem_wte_grad_buffer);
+  nvshmem_free(model->nvshmem_token_buffer);
 }
 
 #ifndef TESTING
@@ -1687,15 +1724,6 @@ int main(int argc, char *argv[]) {
   cudaDeviceSynchronize();
   nvshmem_barrier_all();
 
-  // Initialize NCCL
-  ncclUniqueId nccl_id;
-  if (my_pe == 0) {
-    ncclCheck(ncclGetUniqueId(&nccl_id));
-  }
-  MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD);
-  ncclComm_t nccl_comm;
-  ncclCheck(ncclCommInitRank(&nccl_comm, n_pes, nccl_id, my_pe));
-
   // Parse arguments
   const char *train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
   const char *val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
@@ -1787,7 +1815,6 @@ int main(int argc, char *argv[]) {
   // Build model with partitioning
   GPT2 model;
   gpt2_build_from_checkpoint_partitioned(&model, "gpt2_124M.bin", &part);
-  model.nccl_comm = nccl_comm;
 
   if (my_pe == 0) {
     printf("| max_sequence_length T  | %-50d |\n", model.config.max_seq_len);
@@ -1879,8 +1906,19 @@ int main(int argc, char *argv[]) {
           }
           fflush(stdout);
         }
-        // Broadcast next token to all PEs from last PE
-        MPI_Bcast(&gen_tokens[t], 1, MPI_INT, n_pes - 1, MPI_COMM_WORLD);
+        // Send next token from last PE to PE 0 only using NVSHMEM point-to-point
+        // Only PE 0 needs the token for the next embedding lookup
+        if (my_pe == n_pes - 1) {
+          cudaCheck(cudaMemcpy(model.nvshmem_token_buffer, &gen_tokens[t], sizeof(int), cudaMemcpyHostToDevice));
+          nvshmem_int_put(model.nvshmem_token_buffer, model.nvshmem_token_buffer, 1, 0);
+          nvshmem_quiet();
+        }
+        nvshmem_barrier_all();
+        // Only PE 0 copies the token from GPU to CPU
+        if (my_pe == 0) {
+          cudaCheck(cudaMemcpy(&gen_tokens[t], model.nvshmem_token_buffer, sizeof(int), cudaMemcpyDeviceToHost));
+        }
+        nvshmem_barrier_all();
       }
       if (my_pe == n_pes - 1) printf("\n---\n");
     }
@@ -1929,4 +1967,3 @@ int main(int argc, char *argv[]) {
   return 0;
 }
 #endif
-
