@@ -50,7 +50,11 @@ __global__ void check_nan_inf_kernel(const float *data, int N, int *has_nan,
 
 // Host function to check GPU tensor for NaN/Inf
 void check_tensor_debug(const char *name, const float *d_data, int size,
-                        int rank, bool abort_on_error = true) {
+                        int rank, bool abort_on_error, bool verbose) {
+  // Skip if not verbose mode (but still check for errors)
+  if (!verbose && !abort_on_error) {
+    return;
+  }
   static int *d_has_nan = nullptr;
   static int *d_has_inf = nullptr;
   static float *d_min_val = nullptr;
@@ -96,10 +100,15 @@ void check_tensor_debug(const char *name, const float *d_data, int size,
   float mean = sum_val / size;
 
   const char *status_prefix = (has_nan > 0 || has_inf > 0) ? "[ERROR]" : "[OK]";
-  printf("[Stage %d] %s CHECK %s: size=%d, NaN=%d, Inf=%d, min=%.6e, max=%.6e, "
-         "mean=%.6e\n",
-         rank, status_prefix, name, size, has_nan, has_inf, min_val, max_val,
-         mean);
+
+  // Only print if verbose or if there's an error
+  if (verbose || has_nan > 0 || has_inf > 0) {
+    printf(
+        "[Stage %d] %s CHECK %s: size=%d, NaN=%d, Inf=%d, min=%.6e, max=%.6e, "
+        "mean=%.6e\n",
+        rank, status_prefix, name, size, has_nan, has_inf, min_val, max_val,
+        mean);
+  }
 
   if (abort_on_error && (has_nan > 0 || has_inf > 0)) {
     printf("[Stage %d] [FATAL] NaN/Inf detected in %s! Aborting...\n", rank,

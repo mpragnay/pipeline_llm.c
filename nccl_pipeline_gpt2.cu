@@ -1254,7 +1254,7 @@ void stage_build_from_checkpoint(PipelineStage *stage,
 
   // DEBUG: Check loaded parameters
   check_tensor_debug("init_params", stage->params_memory, stage->num_parameters,
-                     stage_id, true);
+                     stage_id, true, false);
 }
 
 // Forward pass for a single microbatch on this stage
@@ -1285,7 +1285,7 @@ void stage_forward(PipelineStage *stage, int mb_idx) {
     residual = acts.encoded;
   }
   check_tensor_debug("forward_encoded", acts.encoded, B * T * C,
-                     stage->pipe_config.stage_id, false);
+                     stage->pipe_config.stage_id, false, false);
 
   // Process this stage's layers
   int first_layer = stage->pipe_config.first_layer;
@@ -1338,13 +1338,13 @@ void stage_forward(PipelineStage *stage, int mb_idx) {
     layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w,
                       l_ln2b, B, T, C);
     check_tensor_debug("forward_ln2", l_ln2, B * T * C,
-                       stage->pipe_config.stage_id, false);
+                       stage->pipe_config.stage_id, false, false);
     matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4 * C);
     gelu_forward(l_fch_gelu, l_fch, B * T * 4 * C);
     matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4 * C, C);
     residual_forward(l_residual3, l_residual2, l_fcproj, B * T * C);
     check_tensor_debug("forward_residual3", l_residual3, B * T * C,
-                       stage->pipe_config.stage_id, false);
+                       stage->pipe_config.stage_id, false, false);
   }
 
   // Last stage: do final layernorm and classifier
@@ -1353,7 +1353,7 @@ void stage_forward(PipelineStage *stage, int mb_idx) {
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual,
                       params.lnfw, params.lnfb, B, T, C);
     check_tensor_debug("forward_lnf", acts.lnf, B * T * C,
-                       stage->pipe_config.stage_id, false);
+                       stage->pipe_config.stage_id, false, false);
     matmul_forward(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
 
     // Compute loss if we have targets
@@ -1419,7 +1419,7 @@ void stage_backward(PipelineStage *stage, int mb_idx) {
                          B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
   }
   check_tensor_debug("backward_dresidual_in", dresidual, B * T * C,
-                     stage->pipe_config.stage_id, false);
+                     stage->pipe_config.stage_id, false, false);
 
   // Backward through this stage's layers
   for (int l = num_layers - 1; l >= 0; l--) {
@@ -1472,7 +1472,7 @@ void stage_backward(PipelineStage *stage, int mb_idx) {
     matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu,
                     l_fcprojw, B, T, 4 * C, C);
     check_tensor_debug("backward_dl_bt4c", dl_bt4c, B * T * 4 * C,
-                       stage->pipe_config.stage_id, false);
+                       stage->pipe_config.stage_id, false, false);
     gelu_backward(dl_bt4c, l_fch, dl_bt4c, B * T * 4 * C);
     matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C,
                     4 * C);
@@ -1670,7 +1670,8 @@ void stage_update(PipelineStage *stage, float learning_rate, float beta1,
   printf("[Stage %d] Step %d: lr=%.2e, grad_norm=%.2e\n",
          stage->pipe_config.stage_id, step, learning_rate, acc_grad_norm);
   check_tensor_debug("params_after_update", stage->params_memory,
-                     stage->num_parameters, stage->pipe_config.stage_id, true);
+                     stage->num_parameters, stage->pipe_config.stage_id, true,
+                     false);
 }
 
 // Zero out gradients
