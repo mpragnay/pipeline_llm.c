@@ -1664,11 +1664,11 @@ void stage_update(PipelineStage *stage, float learning_rate, float beta1,
   cudaCheck(cudaGetLastError());
   cudaCheck(cudaDeviceSynchronize());
 
-  // DEBUG: Critical check - parameters after optimizer update
-  float acc_grad_norm = compute_gradient_norm(stage->grads_accumulated_memory,
-                                              stage->num_parameters);
+  // DEBUG: Check gradient norm that was used for update
+  float grad_norm_used =
+      compute_gradient_norm(stage->grads_memory, stage->num_parameters);
   printf("[Stage %d] Step %d: lr=%.2e, grad_norm=%.2e\n",
-         stage->pipe_config.stage_id, step, learning_rate, acc_grad_norm);
+         stage->pipe_config.stage_id, step, learning_rate, grad_norm_used);
   check_tensor_debug("params_after_update", stage->params_memory,
                      stage->num_parameters, stage->pipe_config.stage_id, true,
                      false);
@@ -2088,6 +2088,12 @@ int main(int argc, char *argv[]) {
           stage.grads_memory, stage.num_parameters, scale);
       cudaCheck(cudaGetLastError());
       cudaCheck(cudaDeviceSynchronize());
+
+      // Verify clipping worked
+      float grad_norm_after =
+          compute_gradient_norm(stage.grads_memory, stage.num_parameters);
+      printf("[Stage %d] Clipped: %.2e -> %.2e\n", rank, grad_norm,
+             grad_norm_after);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
