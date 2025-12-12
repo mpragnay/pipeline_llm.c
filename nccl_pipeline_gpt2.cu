@@ -1716,6 +1716,68 @@ void clip_gradients(float *grads, size_t num_params, float max_norm) {
   }
 }
 
+// Synchronize parameters between stages after optimizer update
+// CRITICAL: Each stage updates only its owned layers, but needs the full model
+// Stage 0 sends: embeddings (wte, wpe) + layers 0-5
+// Stage 1 sends: layers 6-11 + final layer norm (lnfw, lnfb)
+void stage_sync_parameters(PipelineStage *stage) {
+  int C = stage->config.channels;
+  int Vp = stage->config.padded_vocab_size;
+  int maxT = stage->config.max_seq_len;
+  int rank = stage->pipe_config.stage_id;
+
+  // Calculate sizes for parameter chunks
+  size_t embedding_size = Vp * C + maxT * C;    // wte + wpe
+  size_t layer_param_size = C + C +             // ln1w, ln1b
+                            3 * C * C + 3 * C + // qkvw, qkvb
+                            C * C + C +         // attprojw, attprojb
+                            C + C +             // ln2w, ln2b
+                            4 * C * C + 4 * C + // fcw, fcb
+                            C * 4 * C + C;      // fcprojw, fcprojb
+  size_t lnf_size = 2 * C;                      // lnfw + lnfb
+
+  if (stage->pipe_config.is_first_stage && !stage->pipe_config.is_last_stage) {
+    // Stage 0: Send embeddings + layers 0-5 to Stage 1
+    size_t stage0_params_size =
+        embedding_size + stage->pipe_config.num_layers * layer_param_size;
+
+    // Send to Stage 1
+    ncclCheck(ncclSend(stage->params_memory, stage0_params_size, ncclFloat,
+                       rank + 1, stage->nccl_comm, cudaStreamDefault));
+
+    // Receive layers 6-11 + lnf from Stage 1
+    size_t stage1_params_offset =
+        embedding_size + stage->pipe_config.num_layers * layer_param_size;
+    size_t stage1_params_size = 6 * layer_param_size + lnf_size;
+
+    ncclCheck(ncclRecv(stage->params_memory + stage1_params_offset,
+                       stage1_params_size, ncclFloat, rank + 1,
+                       stage->nccl_comm, cudaStreamDefault));
+
+  } else if (stage->pipe_config.is_last_stage &&
+             !stage->pipe_config.is_first_stage) {
+    // Stage 1: Send layers 6-11 + lnf to Stage 0
+    size_t stage1_params_offset = embedding_size + 6 * layer_param_size;
+    size_t stage1_params_size = 6 * layer_param_size + lnf_size;
+
+    // Receive embeddings + layers 0-5 from Stage 0
+    ncclCheck(ncclRecv(stage->params_memory,
+                       embedding_size + 6 * layer_param_size, ncclFloat,
+                       rank - 1, stage->nccl_comm, cudaStreamDefault));
+
+    // Send layers 6-11 + lnf to Stage 0
+    ncclCheck(ncclSend(stage->params_memory + stage1_params_offset,
+                       stage1_params_size, ncclFloat, rank - 1,
+                       stage->nccl_comm, cudaStreamDefault));
+  }
+
+  cudaCheck(cudaDeviceSynchronize());
+
+  if (rank == 0) {
+    printf("[DEBUG] Parameters synchronized between stages\n");
+  }
+}
+
 // ----------------------------------------------------------------------------
 // Sampling utilities for text generation
 
@@ -2117,6 +2179,14 @@ int main(int argc, char *argv[]) {
 
     // Apply optimizer update
     stage_update(&stage, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, iter + 1);
+
+    cudaCheck(cudaDeviceSynchronize());
+
+    // CRITICAL: Synchronize parameters between stages
+    // Each stage updated only its owned layers, now exchange full model
+    if (rank == 0)
+      printf("[DEBUG] Synchronizing parameters between stages...\n");
+    stage_sync_parameters(&stage);
 
     cudaCheck(cudaDeviceSynchronize());
 
