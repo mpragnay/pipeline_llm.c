@@ -1026,7 +1026,7 @@ typedef struct {
   float *grads_acts_memory;
   int batch_size;
   int micro_batch_size;           // micro-batch size for pipeline parallelism
-  int micro_batches_per_batch;    // number of micro-batches per batch
+  int micro_batches_per_batch;    // number of micro-batches per batch, also fwd_flags and bwd_flags buffer sizes
   int seq_len;
   int *inputs;
   int *targets;
@@ -1037,6 +1037,8 @@ typedef struct {
   size_t nvshmem_buffer_size;
   float *nvshmem_wte_grad_buffer;  // symmetric buffer for wte gradient allreduce
   int *nvshmem_token_buffer;       // symmetric buffer for token broadcast
+  int *fwd_flags;
+  int *bwd_flags;
 } GPT2;
 
 void gpt2_build_from_checkpoint_partitioned(GPT2 *model, const char *checkpoint_path,
@@ -1211,18 +1213,38 @@ void gpt2_allocate_nvshmem_buffers(GPT2 *model) {
   // Allocate symmetric buffer for token broadcast during generation
   model->nvshmem_token_buffer = (int *)nvshmem_malloc(sizeof(int));
 
+  cudaCheck(cudaMemset(model->nvshmem_act_buffer, 0, model->nvshmem_buffer_size));
+  cudaCheck(cudaMemset(model->nvshmem_grad_buffer, 0, model->nvshmem_buffer_size));
+  cudaCheck(cudaMemset(model->nvshmem_wte_grad_buffer, 0, wte_grad_size * n_pes));
+
+  // Allocate forward and backward flags buffer for all micro_batches
+  printf("Allocating with micro_batches_per_batch=%d\n", model->micro_batches_per_batch);
+  model->fwd_flags = (int *)nvshmem_malloc((size_t)model->micro_batches_per_batch * sizeof(int));
+  model->bwd_flags = (int *)nvshmem_malloc((size_t)model->micro_batches_per_batch * sizeof(int));
+
   if (model->nvshmem_act_buffer == NULL || model->nvshmem_grad_buffer == NULL ||
-      model->nvshmem_wte_grad_buffer == NULL || model->nvshmem_token_buffer == NULL) {
+      model->nvshmem_wte_grad_buffer == NULL || model->nvshmem_token_buffer == NULL ||
+      model->fwd_flags == NULL || model->bwd_flags == NULL) {
     printf("[PE %d] Error: Failed to allocate NVSHMEM buffers\n", my_pe);
     exit(EXIT_FAILURE);
   }
 
-  printf("[PE %d] allocated %zu MiB for NVSHMEM buffers\n", my_pe,
-         (2 * model->nvshmem_buffer_size + wte_grad_size * n_pes) >> 20);
+  printf("[PE %d] allocated %zu MiB for NVSHMEM buffers and %zu bytes for fwd and bwd flags buffers\n", my_pe,
+         (2 * model->nvshmem_buffer_size + wte_grad_size * n_pes) >> 20, (2 * (size_t)model->micro_batches_per_batch * sizeof(int)));
 
-  cudaCheck(cudaMemset(model->nvshmem_act_buffer, 0, model->nvshmem_buffer_size));
-  cudaCheck(cudaMemset(model->nvshmem_grad_buffer, 0, model->nvshmem_buffer_size));
-  cudaCheck(cudaMemset(model->nvshmem_wte_grad_buffer, 0, wte_grad_size * n_pes));
+  int *cpu_fwd_flags = (int *)malloc(model->micro_batches_per_batch * sizeof(int));
+  cudaCheck(cudaMemcpy(cpu_fwd_flags, model->fwd_flags, model->micro_batches_per_batch * sizeof(int), cudaMemcpyDeviceToHost));
+  printf("[PE %d] Initial fwd_flags: ", my_pe);
+  for (int i = 0; i < model->micro_batches_per_batch; ++i) {
+    printf("%d ", cpu_fwd_flags[i]);
+  }
+  printf("\n");
+  free(cpu_fwd_flags);
+
+  // Initialize to zero
+  cudaCheck(cudaMemset(model->fwd_flags, 0, (size_t)model->micro_batches_per_batch * sizeof(int)));
+  cudaCheck(cudaMemset(model->bwd_flags, 0, (size_t)model->micro_batches_per_batch * sizeof(int)));
+  nvshmem_barrier_all();
 }
 
 void printer(int B, int T, int C, int micro_batch_no, float* arr, const char* initial) {
@@ -1264,6 +1286,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
     }
   }
 
+  // Allocate Activations
   if (model->acts_memory == NULL) {
     model->batch_size = B;
     model->seq_len = T;
@@ -1286,6 +1309,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
     }
   }
 
+  printf("[PE %d] copying inputs and targets to device\n", my_pe);
   cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
   if (targets != NULL) {
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
@@ -1303,6 +1327,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
   }
 
+  printf("[PE %d] Resetting forward flags\n", my_pe);
+  // Reset fwd_flags to zero before starting
+  cudaCheck(cudaMemset(model->fwd_flags, 0, (size_t)micro_batches_per_batch * sizeof(int)));
+  cudaCheck(cudaDeviceSynchronize());
+  printf("[PE %d] Forward flags reset\n", my_pe);
+
   // Process micro-batches
   for (int mb = 0; mb < micro_batches_per_batch; mb++) {
     int batch_offset = mb * micro_batch_size;
@@ -1318,8 +1348,11 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
       if (my_pe == target_pe) {
         // Non-first PEs: receive activations from previous PE
         if (my_pe > 0) {
-          // Copy from nvshmem buffer to local buffer (already transferred by previous PE)
           cudaCheck(cudaDeviceSynchronize());
+          printf("[PE %d] Waiting for forward flag with current value\n", my_pe);
+          printf("%d\n", model->fwd_flags[mb]);
+          nvshmemx_int32_wait_until_on_stream(model->fwd_flags + mb, NVSHMEM_CMP_EQ, 1, 0);
+          printf("FORWARD: fwd_flag %d received on PE[%d]", model->fwd_flags[mb], my_pe);
         }
 
         // Process this PE's layers for this micro-batch
@@ -1376,7 +1409,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
           residual_forward(l_residual3, l_residual2, l_fcproj, local_B * T * C);
 
           if (log && l == part.num_layers - 1) {
-            printer(local_B, T, C, mb, l_residual3, "FORWARD l_residual3");
+            printer(local_B, T, C, mb, l_residual3, "FORWARD: l_residual3");
           }
         }
 
@@ -1385,8 +1418,14 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
           float *last_output = acts.residual3 + (size_t)(part.num_layers - 1) * B * T * C + (size_t)batch_offset * T * C;
           float *nvshmem_dest = model->nvshmem_act_buffer + (size_t)batch_offset * T * C;
           cudaCheck(cudaDeviceSynchronize());
+          if (log) {
+            printer(micro_batch_size, T, C, mb, last_output, "FORWARD: last_output ");
+          }
           nvshmem_putmem(nvshmem_dest, last_output, local_B * T * C * sizeof(float), my_pe + 1);
           nvshmem_quiet();
+          // last_output sent, now notify
+          // model->fwd_flags[mb] = 1;
+          nvshmem_int_p(model->fwd_flags + mb, 1, my_pe + 1);
         }
 
         // Last PE: final layernorm + classifier + loss for this micro-batch
@@ -1410,8 +1449,8 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
         }
       }
 
-      // Synchronize all PEs before next PE processes
-      nvshmem_barrier_all();
+      // // Synchronize all PEs before next PE processes
+      // nvshmem_barrier_all();
     }
   }
 
@@ -1687,6 +1726,8 @@ void gpt2_free(GPT2 *model) {
   nvshmem_free(model->nvshmem_grad_buffer);
   nvshmem_free(model->nvshmem_wte_grad_buffer);
   nvshmem_free(model->nvshmem_token_buffer);
+  nvshmem_free(model->fwd_flags);
+  nvshmem_free(model->bwd_flags);
 }
 
 #ifndef TESTING
@@ -1955,13 +1996,15 @@ int main(int argc, char *argv[]) {
 
   // Allocate NVSHMEM buffers
   gpt2_allocate_nvshmem_buffers(&model);
+  printf("NVSHMEM buffers allocated\n");
 
   // Dummy forward to allocate activations
   int *dummy_batch = (int *)malloc(B * T * sizeof(int));
   for (int i = 0; i < B * T; i++) dummy_batch[i] = 0;
-  gpt2_forward(&model, dummy_batch, NULL, B, T);
+  gpt2_forward(&model, dummy_batch, NULL, B, T, true);
   free(dummy_batch);
 
+  printf("dummy forward done\n");
   // Setup logger and tokenizer
   Logger logger;
   logger_init(&logger, output_log_file);
@@ -1977,6 +2020,7 @@ int main(int argc, char *argv[]) {
   struct timespec start, end;
   double total_sum_iteration_time_s = 0.0;
 
+  printf("Starting training\n");
   for (int step = 0; step <= train_num_batches; step++) {
     int last_step = step == train_num_batches;
 
@@ -2039,7 +2083,8 @@ int main(int argc, char *argv[]) {
     // Training step
     clock_gettime(CLOCK_MONOTONIC, &start);
     dataloader_next_batch(&train_loader);
-    gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+    printf("Training step %d\n", step);
+    gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, true);
     gpt2_zero_grad(&model);
     gpt2_backward(&model);
     gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step + 1);
