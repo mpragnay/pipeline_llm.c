@@ -325,7 +325,7 @@ nccl_pipeline_gpt2: nccl_pipeline_gpt2.cu
 	$(NVCC) --threads=0 -t=0 --use_fast_math -std=c++14 -O3 \
 		-arch=sm_75 \
 		-I$(OPENMPI_INCLUDE_PATH) -L$(OPENMPI_LIB_PATH) \
-		$^ -lnccl -lcublas -lcublasLt -lcuda -lcudart -lnvidia-ml -lmpi \
+		$^ -lnccl -lcublas -lcublasLt -lcudart -lmpi \
 		$(CUDA_OUTPUT_FILE)
 
 
@@ -335,7 +335,7 @@ test_nccl_simple: test_nccl_simple.cu
 	$(NVCC) --threads=0 -t=0 --use_fast_math -std=c++14 -O3 \
 		-arch=sm_75 \
 		-I$(OPENMPI_INCLUDE_PATH) -L$(OPENMPI_LIB_PATH) \
-		$^ -lnccl -lcuda -lcudart -lmpi \
+		$^ -lnccl -lcudart -lmpi \
 		$(CUDA_OUTPUT_FILE)
 
 clean:
