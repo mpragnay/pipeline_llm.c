@@ -1680,6 +1680,10 @@ void stage_zero_grad(PipelineStage *stage) {
   // Accumulated gradients are zeroed after optimizer update
   cudaCheck(cudaMemset(stage->grads_memory, 0,
                        stage->num_parameters * sizeof(float)));
+  // CRITICAL: Zero out activation gradients too, as kernels accumulate into
+  // them!
+  cudaCheck(cudaMemset(stage->grads_acts_memory, 0,
+                       stage->num_grad_acts * sizeof(float)));
 }
 
 // Gradient clipping kernel
