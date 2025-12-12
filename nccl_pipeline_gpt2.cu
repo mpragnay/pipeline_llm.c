@@ -1836,8 +1836,8 @@ int main(int argc, char *argv[]) {
       "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
   int microbatch_size = 4;
   int num_microbatches = 1; // Default to 1 for easier debugging
-  int seq_len = 256;
-  int num_iterations = 1; // Default to 1 for easier debugging
+  int seq_len = 1024;
+  int num_iterations = 10; // Default to 10 for easier debugging
   float learning_rate = 3e-4f;
   int val_loss_every = 20;
   int val_max_steps = 20;
