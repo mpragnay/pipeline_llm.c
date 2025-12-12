@@ -1508,6 +1508,7 @@ void stage_backward(PipelineStage *stage, int mb_idx) {
 }
 
 // Update parameters using accumulated gradients
+// CRITICAL: Only update parameters for layers owned by this stage!
 void stage_update(PipelineStage *stage, float learning_rate, float beta1,
                   float beta2, float eps, float weight_decay, int step) {
   // Lazily allocate optimizer memory
@@ -1526,14 +1527,137 @@ void stage_update(PipelineStage *stage, float learning_rate, float beta1,
   }
 
   int block_size = 512;
-  int num_blocks = CEIL_DIV(stage->num_parameters, block_size);
   float beta1_correction = 1.0f - powf(beta1, step);
   float beta2_correction = 1.0f - powf(beta2, step);
 
-  adamw_kernel2<<<num_blocks, block_size>>>(
-      stage->params_memory, stage->grads_accumulated_memory, stage->m_memory,
-      stage->v_memory, stage->num_parameters, learning_rate, beta1, beta2,
-      beta1_correction, beta2_correction, eps, weight_decay);
+  // Calculate parameter offsets for this stage's layers
+  int C = stage->config.channels;
+  int Vp = stage->config.padded_vocab_size;
+  int maxT = stage->config.max_seq_len;
+  int first_layer = stage->pipe_config.first_layer;
+  int num_layers = stage->pipe_config.num_layers;
+
+  // Update embeddings (only on first stage)
+  if (stage->pipe_config.is_first_stage) {
+    size_t wte_size = Vp * C;
+    size_t wpe_size = maxT * C;
+    int num_blocks;
+
+    // Update wte
+    num_blocks = CEIL_DIV(wte_size, block_size);
+    adamw_kernel2<<<num_blocks, block_size>>>(
+        stage->params.wte, stage->grads.wte, stage->m_memory, stage->v_memory,
+        wte_size, learning_rate, beta1, beta2, beta1_correction,
+        beta2_correction, eps, weight_decay);
+
+    // Update wpe (offset m/v memory)
+    num_blocks = CEIL_DIV(wpe_size, block_size);
+    adamw_kernel2<<<num_blocks, block_size>>>(
+        stage->params.wpe, stage->grads.wpe, stage->m_memory + wte_size,
+        stage->v_memory + wte_size, wpe_size, learning_rate, beta1, beta2,
+        beta1_correction, beta2_correction, eps, weight_decay);
+  }
+
+  // Update parameters for this stage's transformer layers
+  size_t offset_in_full_model = 0;
+  if (stage->pipe_config.is_first_stage) {
+    offset_in_full_model = Vp * C + maxT * C; // Skip wte, wpe
+  }
+
+  // Calculate offset to this stage's first layer in the full parameter array
+  for (int l = 0; l < first_layer; l++) {
+    offset_in_full_model += C;         // ln1w
+    offset_in_full_model += C;         // ln1b
+    offset_in_full_model += 3 * C * C; // qkvw
+    offset_in_full_model += 3 * C;     // qkvb
+    offset_in_full_model += C * C;     // attprojw
+    offset_in_full_model += C;         // attprojb
+    offset_in_full_model += C;         // ln2w
+    offset_in_full_model += C;         // ln2b
+    offset_in_full_model += 4 * C * C; // fcw
+    offset_in_full_model += 4 * C;     // fcb
+    offset_in_full_model += C * 4 * C; // fcprojw
+    offset_in_full_model += C;         // fcprojb
+  }
+
+  // Now update only the layers owned by this stage
+  for (int l = 0; l < num_layers; l++) {
+    int global_l = first_layer + l;
+    size_t layer_offset = 0;
+
+    // Update each parameter tensor for this layer
+    size_t param_sizes[] = {
+        C,         // ln1w
+        C,         // ln1b
+        3 * C * C, // qkvw
+        3 * C,     // qkvb
+        C * C,     // attprojw
+        C,         // attprojb
+        C,         // ln2w
+        C,         // ln2b
+        4 * C * C, // fcw
+        4 * C,     // fcb
+        C * 4 * C, // fcprojw
+        C          // fcprojb
+    };
+
+    float *param_ptrs[] = {stage->params.ln1w + global_l * C,
+                           stage->params.ln1b + global_l * C,
+                           stage->params.qkvw + global_l * 3 * C * C,
+                           stage->params.qkvb + global_l * 3 * C,
+                           stage->params.attprojw + global_l * C * C,
+                           stage->params.attprojb + global_l * C,
+                           stage->params.ln2w + global_l * C,
+                           stage->params.ln2b + global_l * C,
+                           stage->params.fcw + global_l * 4 * C * C,
+                           stage->params.fcb + global_l * 4 * C,
+                           stage->params.fcprojw + global_l * C * 4 * C,
+                           stage->params.fcprojb + global_l * C};
+
+    float *grad_ptrs[] = {stage->grads.ln1w + global_l * C,
+                          stage->grads.ln1b + global_l * C,
+                          stage->grads.qkvw + global_l * 3 * C * C,
+                          stage->grads.qkvb + global_l * 3 * C,
+                          stage->grads.attprojw + global_l * C * C,
+                          stage->grads.attprojb + global_l * C,
+                          stage->grads.ln2w + global_l * C,
+                          stage->grads.ln2b + global_l * C,
+                          stage->grads.fcw + global_l * 4 * C * C,
+                          stage->grads.fcb + global_l * 4 * C,
+                          stage->grads.fcprojw + global_l * C * 4 * C,
+                          stage->grads.fcprojb + global_l * C};
+
+    for (int i = 0; i < 12; i++) {
+      int num_blocks = CEIL_DIV(param_sizes[i], block_size);
+      adamw_kernel2<<<num_blocks, block_size>>>(
+          param_ptrs[i], grad_ptrs[i],
+          stage->m_memory + offset_in_full_model + layer_offset,
+          stage->v_memory + offset_in_full_model + layer_offset, param_sizes[i],
+          learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps,
+          weight_decay);
+      layer_offset += param_sizes[i];
+    }
+  }
+
+  // Update final layer norm (only on last stage)
+  if (stage->pipe_config.is_last_stage) {
+    size_t lnf_offset = stage->num_parameters - 2 * C;
+    int num_blocks;
+
+    // Update lnfw
+    num_blocks = CEIL_DIV(C, block_size);
+    adamw_kernel2<<<num_blocks, block_size>>>(
+        stage->params.lnfw, stage->grads.lnfw, stage->m_memory + lnf_offset,
+        stage->v_memory + lnf_offset, C, learning_rate, beta1, beta2,
+        beta1_correction, beta2_correction, eps, weight_decay);
+
+    // Update lnfb
+    adamw_kernel2<<<num_blocks, block_size>>>(
+        stage->params.lnfb, stage->grads.lnfb, stage->m_memory + lnf_offset + C,
+        stage->v_memory + lnf_offset + C, C, learning_rate, beta1, beta2,
+        beta1_correction, beta2_correction, eps, weight_decay);
+  }
+
   cudaCheck(cudaGetLastError());
   cudaCheck(cudaDeviceSynchronize());
 
