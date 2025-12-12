@@ -1835,37 +1835,54 @@ int main(int argc, char *argv[]) {
   int val_max_steps = 20;
   int sample_every = 20;
   int genT = 64;
+  int verbose = 0; // Verbose logging flag (0 = minimal, 1 = detailed debug)
 
-  for (int i = 1; i < argc; i += 2) {
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--verbose") == 0) {
+      verbose = 1;
+      continue; // No value needed, just a flag
+    }
+
     if (i + 1 >= argc) {
       if (rank == 0)
         fprintf(stderr, "Error: missing value for argument %s\n", argv[i]);
       MPI_Finalize();
       return EXIT_FAILURE;
     }
-    if (strcmp(argv[i], "--checkpoint") == 0)
+    if (strcmp(argv[i], "--checkpoint") == 0) {
       checkpoint_path = argv[i + 1];
-    else if (strcmp(argv[i], "--train_data") == 0)
+      i++;
+    } else if (strcmp(argv[i], "--train_data") == 0) {
       train_data_pattern = argv[i + 1];
-    else if (strcmp(argv[i], "--val_data") == 0)
+      i++;
+    } else if (strcmp(argv[i], "--val_data") == 0) {
       val_data_pattern = argv[i + 1];
-    else if (strcmp(argv[i], "--batch_size") == 0)
+      i++;
+    } else if (strcmp(argv[i], "--batch_size") == 0) {
       microbatch_size = atoi(argv[i + 1]);
-    else if (strcmp(argv[i], "--num_microbatches") == 0)
+      i++;
+    } else if (strcmp(argv[i], "--num_microbatches") == 0) {
       num_microbatches = atoi(argv[i + 1]);
-    else if (strcmp(argv[i], "--seq_len") == 0)
+      i++;
+    } else if (strcmp(argv[i], "--seq_len") == 0) {
       seq_len = atoi(argv[i + 1]);
-    else if (strcmp(argv[i], "--num_iterations") == 0)
+      i++;
+    } else if (strcmp(argv[i], "--num_iterations") == 0) {
       num_iterations = atoi(argv[i + 1]);
-    else if (strcmp(argv[i], "--learning_rate") == 0)
+      i++;
+    } else if (strcmp(argv[i], "--learning_rate") == 0) {
       learning_rate = atof(argv[i + 1]);
-    else if (strcmp(argv[i], "--val_every") == 0)
+      i++;
+    } else if (strcmp(argv[i], "--val_every") == 0) {
       val_loss_every = atoi(argv[i + 1]);
-    else if (strcmp(argv[i], "--sample_every") == 0)
+      i++;
+    } else if (strcmp(argv[i], "--sample_every") == 0) {
       sample_every = atoi(argv[i + 1]);
-    else if (strcmp(argv[i], "--gen_tokens") == 0)
+      i++;
+    } else if (strcmp(argv[i], "--gen_tokens") == 0) {
       genT = atoi(argv[i + 1]);
-    else {
+      i++;
+    } else {
       if (rank == 0)
         fprintf(stderr, "Unknown argument: %s\n", argv[i]);
       MPI_Finalize();
