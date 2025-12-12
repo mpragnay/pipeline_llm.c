@@ -2086,6 +2086,14 @@ int main(int argc, char *argv[]) {
                             stage.nccl_comm, cudaStreamDefault));
     cudaCheck(cudaDeviceSynchronize());
 
+    // CRITICAL: Stage 1 doesn't update wte/wpe, zero them after AllReduce
+    // Otherwise gradient norm includes them twice
+    if (!stage.pipe_config.is_first_stage) {
+      cudaCheck(cudaMemset(stage.grads.wte, 0, Vp * C * sizeof(float)));
+      int maxT = stage.config.max_seq_len;
+      cudaCheck(cudaMemset(stage.grads.wpe, 0, maxT * C * sizeof(float)));
+    }
+
     MPI_Barrier(MPI_COMM_WORLD);
 
     // 7. Gradient Clipping (AFTER AllReduce, clips combined gradients)
