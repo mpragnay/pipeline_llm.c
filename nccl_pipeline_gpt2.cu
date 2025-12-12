@@ -2007,152 +2007,311 @@ int main(int argc, char *argv[]) {
 
   // Main training loop
   for (int iter = 0; iter < num_iterations; iter++) {
-    // 1. Load one batch
-    dataloader_next_batch(&train_loader);
-    cudaCheck(
-        cudaMemcpy(stage.inputs, train_loader.inputs,
-                   microbatch_size * num_microbatches * seq_len * sizeof(int),
-                   cudaMemcpyHostToDevice));
-    cudaCheck(
-        cudaMemcpy(stage.targets, train_loader.targets,
-                   microbatch_size * num_microbatches * seq_len * sizeof(int),
-                   cudaMemcpyHostToDevice));
-    cudaCheck(cudaDeviceSynchronize());
+    // Main training loop
+    for (int iter = 0; iter < num_iterations; iter++) {
+      // Generation loop
+      if ((iter > 0 && iter % sample_every == 0) ||
+          iter == num_iterations - 1) {
+        if (rank == 0 && verbose)
+          printf("[DEBUG] Starting generation...\n");
 
-    MPI_Barrier(MPI_COMM_WORLD);
+        // Initialize gen_tokens with EOT
+        for (int i = 0; i < microbatch_size * seq_len; ++i) {
+          gen_tokens[i] = GPT2_EOT;
+        }
 
-    // 2. Forward Pass
-    int mb_idx = 0;
+        if (rank == 0) {
+          printf("generating:\n---\n");
+          fflush(stdout);
+        }
 
-    if (stage.pipe_config.is_first_stage) {
-      stage_forward(&stage, mb_idx);
-      if (!stage.pipe_config.is_last_stage) {
-        ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
-                           rank + 1, stage.nccl_comm, cudaStreamDefault));
+        for (int t = 1; t < genT; t++) {
+          // Stage 0 sets inputs
+          if (stage.pipe_config.is_first_stage) {
+            // Only copy one microbatch for generation
+            cudaCheck(cudaMemcpy(stage.inputs, gen_tokens,
+                                 microbatch_size * seq_len * sizeof(int),
+                                 cudaMemcpyHostToDevice));
+          }
+
+          // Run forward pass through the pipeline
+          int gen_mb_idx = 0;
+          if (stage.pipe_config.is_first_stage) {
+            stage_forward(&stage, gen_mb_idx);
+            if (!stage.pipe_config.is_last_stage) {
+              ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                                 ncclFloat, rank + 1, stage.nccl_comm,
+                                 cudaStreamDefault));
+            }
+          } else {
+            ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size,
+                               ncclFloat, rank - 1, stage.nccl_comm,
+                               cudaStreamDefault));
+            stage_forward(&stage, gen_mb_idx);
+            if (!stage.pipe_config.is_last_stage) {
+              ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                                 ncclFloat, rank + 1, stage.nccl_comm,
+                                 cudaStreamDefault));
+            }
+          }
+          cudaCheck(cudaDeviceSynchronize());
+          MPI_Barrier(MPI_COMM_WORLD);
+
+          // Last stage samples the next token
+          int next_token = 0;
+          if (stage.pipe_config.is_last_stage) {
+            // Get logits for position t-1
+            // logits are at acts.output + (t-1) * Vp
+            float *logits_device = stage.acts_microbatch[gen_mb_idx].output +
+                                   (t - 1) * stage.config.padded_vocab_size;
+            cudaCheck(cudaMemcpy(cpu_logits, logits_device,
+                                 stage.config.vocab_size * sizeof(float),
+                                 cudaMemcpyDeviceToHost));
+
+            float coin = random_f32(&rng_state);
+            next_token =
+                sample_softmax(cpu_logits, stage.config.vocab_size, coin);
+
+            // Print token
+            if (tokenizer.init_ok) {
+              const char *token_str = tokenizer_decode(&tokenizer, next_token);
+              printf("%s", token_str);
+            } else {
+              printf("%d ", next_token);
+            }
+            fflush(stdout);
+          }
+
+          // Broadcast next_token to all ranks
+          // Since we are using MPI for overall orchestration, use MPI_Bcast
+          // Root of broadcast is the rank of last stage
+          int last_stage_rank = world_size - 1; // Assuming linear mapping
+          MPI_Bcast(&next_token, 1, MPI_INT, last_stage_rank, MPI_COMM_WORLD);
+
+          // Update gen_tokens on all ranks
+          gen_tokens[t] = next_token;
+        }
+        if (rank == 0)
+          printf("\n---\n");
       }
-    } else {
-      ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size, ncclFloat,
-                         rank - 1, stage.nccl_comm, cudaStreamDefault));
-      stage_forward(&stage, mb_idx);
-      if (!stage.pipe_config.is_last_stage) {
-        ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
-                           rank + 1, stage.nccl_comm, cudaStreamDefault));
+
+      // Validation loop
+      if (iter % val_loss_every == 0 || iter == num_iterations - 1) {
+        if (rank == 0 && verbose)
+          printf("[DEBUG] Starting validation...\n");
+        dataloader_reset(&val_loader);
+        float val_loss = 0.0f;
+        for (int i = 0; i < val_max_steps; i++) {
+          dataloader_next_batch(&val_loader);
+          cudaCheck(cudaMemcpy(stage.inputs, val_loader.inputs,
+                               microbatch_size * num_microbatches * seq_len *
+                                   sizeof(int),
+                               cudaMemcpyHostToDevice));
+          cudaCheck(cudaMemcpy(stage.targets, val_loader.targets,
+                               microbatch_size * num_microbatches * seq_len *
+                                   sizeof(int),
+                               cudaMemcpyHostToDevice));
+          cudaCheck(cudaDeviceSynchronize());
+          MPI_Barrier(MPI_COMM_WORLD);
+
+          int val_mb_idx =
+              0; // Just use the first slot for simplicity in validation
+          if (stage.pipe_config.is_first_stage) {
+            stage_forward(&stage, val_mb_idx);
+            if (!stage.pipe_config.is_last_stage) {
+              ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                                 ncclFloat, rank + 1, stage.nccl_comm,
+                                 cudaStreamDefault));
+            }
+          } else {
+            ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size,
+                               ncclFloat, rank - 1, stage.nccl_comm,
+                               cudaStreamDefault));
+            stage_forward(&stage, val_mb_idx);
+            if (!stage.pipe_config.is_last_stage) {
+              ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                                 ncclFloat, rank + 1, stage.nccl_comm,
+                                 cudaStreamDefault));
+            }
+          }
+          cudaCheck(cudaDeviceSynchronize());
+
+          if (stage.pipe_config.is_last_stage) {
+            // mean_loss is updated in stage_forward
+            val_loss += stage.mean_loss;
+          }
+          MPI_Barrier(MPI_COMM_WORLD);
+        }
+
+        if (stage.pipe_config.is_last_stage) {
+          val_loss /= val_max_steps;
+          printf("val loss %f\n", val_loss);
+        }
       }
-    }
 
-    cudaCheck(cudaDeviceSynchronize());
+      struct timespec start, end;
+      clock_gettime(CLOCK_MONOTONIC, &start);
 
-    // 3. Compute loss (last stage only)
-    if (stage.pipe_config.is_last_stage) {
-      cudaCheck(cudaMemcpy(
-          stage.cpu_losses, stage.acts_microbatch[mb_idx].losses,
-          microbatch_size * seq_len * sizeof(float), cudaMemcpyDeviceToHost));
+      // 1. Load one batch
+      dataloader_next_batch(&train_loader);
+      cudaCheck(
+          cudaMemcpy(stage.inputs, train_loader.inputs,
+                     microbatch_size * num_microbatches * seq_len * sizeof(int),
+                     cudaMemcpyHostToDevice));
+      cudaCheck(
+          cudaMemcpy(stage.targets, train_loader.targets,
+                     microbatch_size * num_microbatches * seq_len * sizeof(int),
+                     cudaMemcpyHostToDevice));
+      cudaCheck(cudaDeviceSynchronize());
 
-      float mean_loss = 0.0f;
-      for (int i = 0; i < microbatch_size * seq_len; i++) {
-        mean_loss += stage.cpu_losses[i];
-      }
-      mean_loss /= (microbatch_size * seq_len);
-      stage.mean_loss = mean_loss;
-    }
+      MPI_Barrier(MPI_COMM_WORLD);
 
-    MPI_Barrier(MPI_COMM_WORLD);
+      // 2. Forward Pass
+      int mb_idx = 0;
 
-    // 4. Zero gradients BEFORE backward (FIX: like train_gpt2_fp32.cu)
-    stage_zero_grad(&stage);
-
-    // 5. Backward Pass
-    if (stage.pipe_config.is_last_stage) {
-      stage_backward(&stage, mb_idx);
-      if (!stage.pipe_config.is_first_stage) {
-        ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
-                           rank - 1, stage.nccl_comm, cudaStreamDefault));
-      }
-    } else {
-      if (!stage.pipe_config.is_last_stage) {
+      if (stage.pipe_config.is_first_stage) {
+        stage_forward(&stage, mb_idx);
+        if (!stage.pipe_config.is_last_stage) {
+          ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                             ncclFloat, rank + 1, stage.nccl_comm,
+                             cudaStreamDefault));
+        }
+      } else {
         ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size, ncclFloat,
-                           rank + 1, stage.nccl_comm, cudaStreamDefault));
+                           rank - 1, stage.nccl_comm, cudaStreamDefault));
+        stage_forward(&stage, mb_idx);
+        if (!stage.pipe_config.is_last_stage) {
+          ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                             ncclFloat, rank + 1, stage.nccl_comm,
+                             cudaStreamDefault));
+        }
       }
-      stage_backward(&stage, mb_idx);
+
+      cudaCheck(cudaDeviceSynchronize());
+
+      // 3. Compute loss (last stage only)
+      if (stage.pipe_config.is_last_stage) {
+        cudaCheck(cudaMemcpy(
+            stage.cpu_losses, stage.acts_microbatch[mb_idx].losses,
+            microbatch_size * seq_len * sizeof(float), cudaMemcpyDeviceToHost));
+
+        float mean_loss = 0.0f;
+        for (int i = 0; i < microbatch_size * seq_len; i++) {
+          mean_loss += stage.cpu_losses[i];
+        }
+        mean_loss /= (microbatch_size * seq_len);
+        stage.mean_loss = mean_loss;
+      }
+
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      // 4. Zero gradients BEFORE backward (FIX: like train_gpt2_fp32.cu)
+      stage_zero_grad(&stage);
+
+      // 5. Backward Pass
+      if (stage.pipe_config.is_last_stage) {
+        stage_backward(&stage, mb_idx);
+        if (!stage.pipe_config.is_first_stage) {
+          ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                             ncclFloat, rank - 1, stage.nccl_comm,
+                             cudaStreamDefault));
+        }
+      } else {
+        if (!stage.pipe_config.is_last_stage) {
+          ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size,
+                             ncclFloat, rank + 1, stage.nccl_comm,
+                             cudaStreamDefault));
+        }
+        stage_backward(&stage, mb_idx);
+      }
+
+      cudaCheck(cudaDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      // 6. CRITICAL: AllReduce wte gradients BEFORE clipping
+      // Stage 0 computes wte grads from encoder_backward
+      // Stage 1 computes wte grads from classifier matmul_backward
+      // Sum them FIRST, then clip the combined result
+      int Vp = stage.config.padded_vocab_size;
+      int C = stage.config.channels;
+      ncclCheck(ncclAllReduce((const void *)stage.grads.wte,
+                              (void *)stage.grads.wte, Vp * C, ncclFloat,
+                              ncclSum, stage.nccl_comm, cudaStreamDefault));
+      cudaCheck(cudaDeviceSynchronize());
+
+      // CRITICAL: Stage 1 doesn't update wte/wpe, zero them after AllReduce
+      // Otherwise gradient norm includes them twice
+      if (!stage.pipe_config.is_first_stage) {
+        cudaCheck(cudaMemset(stage.grads.wte, 0, Vp * C * sizeof(float)));
+        int maxT = stage.config.max_seq_len;
+        cudaCheck(cudaMemset(stage.grads.wpe, 0, maxT * C * sizeof(float)));
+      }
+
+      // 7. Optimizer Update (uses grads_memory directly)
+      stage_update(&stage, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, iter + 1);
+      cudaCheck(cudaDeviceSynchronize());
+
+      // 8. Synchronize parameters between stages
+      stage_sync_parameters(&stage);
+      cudaCheck(cudaDeviceSynchronize());
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      // 9. Standardized logging
+      cudaCheck(cudaDeviceSynchronize());
+      clock_gettime(CLOCK_MONOTONIC, &end);
+      double time_elapsed_s =
+          (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+      int tokens_per_second =
+          (microbatch_size * num_microbatches * seq_len) / time_elapsed_s;
+      if (stage.pipe_config.is_last_stage) {
+        printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", iter + 1,
+               num_iterations, stage.mean_loss, time_elapsed_s * 1000,
+               tokens_per_second);
+      }
     }
 
-    cudaCheck(cudaDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
+    // Cleanup
+    dataloader_free(&train_loader);
+    dataloader_free(&val_loader);
+    tokenizer_free(&tokenizer);
+    free(gen_tokens);
+    free(cpu_logits);
+    ncclCommDestroy(stage.nccl_comm);
 
-    // 6. CRITICAL: AllReduce wte gradients BEFORE clipping
-    // Stage 0 computes wte grads from encoder_backward
-    // Stage 1 computes wte grads from classifier matmul_backward
-    // Sum them FIRST, then clip the combined result
-    int Vp = stage.config.padded_vocab_size;
-    int C = stage.config.channels;
-    ncclCheck(ncclAllReduce((const void *)stage.grads.wte,
-                            (void *)stage.grads.wte, Vp * C, ncclFloat, ncclSum,
-                            stage.nccl_comm, cudaStreamDefault));
-    cudaCheck(cudaDeviceSynchronize());
+    // Free stage memory
+    cudaFree(stage.params_memory);
+    cudaFree(stage.grads_memory);
+    cudaFree(stage.grads_accumulated_memory);
+    if (stage.m_memory)
+      cudaFree(stage.m_memory);
+    if (stage.v_memory)
+      cudaFree(stage.v_memory);
+    for (int mb = 0; mb < num_microbatches; mb++) {
+      cudaFree(stage.acts_memory_microbatch[mb]);
+    }
+    free(stage.acts_microbatch);
+    free(stage.acts_memory_microbatch);
+    cudaFree(stage.grads_acts_memory);
+    cudaFree(stage.send_buffer);
+    cudaFree(stage.recv_buffer);
+    cudaFree(stage.inputs);
+    cudaFree(stage.targets);
+    cudaFreeHost(stage.cpu_losses);
 
-    // CRITICAL: Stage 1 doesn't update wte/wpe, zero them after AllReduce
-    // Otherwise gradient norm includes them twice
-    if (!stage.pipe_config.is_first_stage) {
-      cudaCheck(cudaMemset(stage.grads.wte, 0, Vp * C * sizeof(float)));
-      int maxT = stage.config.max_seq_len;
-      cudaCheck(cudaMemset(stage.grads.wpe, 0, maxT * C * sizeof(float)));
+    cublasDestroy(cublas_handle);
+    cudaEventDestroy(start_event);
+    cudaEventDestroy(end_event);
+
+    if (rank == 0) {
+      printf(
+          "==================================================================="
+          "=======\n");
+      printf("Training completed successfully!\n");
+      printf(
+          "==================================================================="
+          "=======\n");
     }
 
-    // 7. Optimizer Update (uses grads_memory directly)
-    stage_update(&stage, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, iter + 1);
-    cudaCheck(cudaDeviceSynchronize());
-
-    // 8. Synchronize parameters between stages
-    stage_sync_parameters(&stage);
-    cudaCheck(cudaDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // 9. Simple logging
-    if (stage.pipe_config.is_last_stage) {
-      printf("[Iter %d] Loss: %.6f\\n", iter + 1, stage.mean_loss);
-    }
+    MPI_Finalize();
+    return 0;
   }
-
-  // Cleanup
-  dataloader_free(&train_loader);
-  dataloader_free(&val_loader);
-  tokenizer_free(&tokenizer);
-  free(gen_tokens);
-  free(cpu_logits);
-  ncclCommDestroy(stage.nccl_comm);
-
-  // Free stage memory
-  cudaFree(stage.params_memory);
-  cudaFree(stage.grads_memory);
-  cudaFree(stage.grads_accumulated_memory);
-  if (stage.m_memory)
-    cudaFree(stage.m_memory);
-  if (stage.v_memory)
-    cudaFree(stage.v_memory);
-  for (int mb = 0; mb < num_microbatches; mb++) {
-    cudaFree(stage.acts_memory_microbatch[mb]);
-  }
-  free(stage.acts_microbatch);
-  free(stage.acts_memory_microbatch);
-  cudaFree(stage.grads_acts_memory);
-  cudaFree(stage.send_buffer);
-  cudaFree(stage.recv_buffer);
-  cudaFree(stage.inputs);
-  cudaFree(stage.targets);
-  cudaFreeHost(stage.cpu_losses);
-
-  cublasDestroy(cublas_handle);
-  cudaEventDestroy(start_event);
-  cudaEventDestroy(end_event);
-
-  if (rank == 0) {
-    printf("==================================================================="
-           "=======\n");
-    printf("Training completed successfully!\n");
-    printf("==================================================================="
-           "=======\n");
-  }
-
-  MPI_Finalize();
-  return 0;
-}
