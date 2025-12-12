@@ -1554,6 +1554,44 @@ void stage_zero_grad(PipelineStage *stage) {
                        stage->num_parameters * sizeof(float)));
 }
 
+// Gradient clipping kernel
+__global__ void gradient_clip_kernel(float *grads, size_t num_params,
+                                     float scale) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < num_params) {
+    grads[idx] *= scale;
+  }
+}
+
+void clip_gradients(float *grads, size_t num_params, float max_norm) {
+  // Compute gradient norm
+  float grad_norm = 0.0f;
+  float *d_grad_norm;
+  cudaCheck(cudaMalloc(&d_grad_norm, sizeof(float)));
+  cudaCheck(cudaMemset(d_grad_norm, 0, sizeof(float)));
+
+  // Simple reduction to compute norm (can be optimized with cublas)
+  float *h_grads = (float *)malloc(num_params * sizeof(float));
+  cudaCheck(cudaMemcpy(h_grads, grads, num_params * sizeof(float),
+                       cudaMemcpyDeviceToHost));
+
+  for (size_t i = 0; i < num_params; i++) {
+    grad_norm += h_grads[i] * h_grads[i];
+  }
+  grad_norm = sqrtf(grad_norm);
+  free(h_grads);
+  cudaFree(d_grad_norm);
+
+  // Clip if necessary
+  if (grad_norm > max_norm) {
+    float scale = max_norm / grad_norm;
+    int block_size = 512;
+    int num_blocks = (num_params + block_size - 1) / block_size;
+    gradient_clip_kernel<<<num_blocks, block_size>>>(grads, num_params, scale);
+    cudaCheck(cudaGetLastError());
+  }
+}
+
 // ----------------------------------------------------------------------------
 // Sampling utilities for text generation
 
@@ -1923,6 +1961,29 @@ int main(int argc, char *argv[]) {
 
     if (rank == 0)
       printf("[DEBUG] Gradient accumulation complete.\n");
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // 5.5 Clip gradients to prevent explosion
+    if (rank == 0)
+      printf("[DEBUG] Clipping gradients...\n");
+
+    float max_grad_norm = 1.0f;
+    float grad_norm_before_clip = accum_norm_after;
+
+    clip_gradients(stage.grads_accumulated_memory, stage.num_parameters,
+                   max_grad_norm);
+
+    float grad_norm_after_clip = compute_gradient_norm(
+        stage.grads_accumulated_memory, stage.num_parameters);
+
+    if (grad_norm_before_clip > max_grad_norm) {
+      printf("[Stage %d] [CLIPPED] Grad norm: %.6e -> %.6e (max=%.1f)\n", rank,
+             grad_norm_before_clip, grad_norm_after_clip, max_grad_norm);
+    } else {
+      printf("[Stage %d] [NO CLIP] Grad norm: %.6e (max=%.1f)\n", rank,
+             grad_norm_after_clip, max_grad_norm);
+    }
 
     MPI_Barrier(MPI_COMM_WORLD);
 
