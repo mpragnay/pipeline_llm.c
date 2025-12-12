@@ -176,9 +176,6 @@ class PipelineGPT2(nn.Module):
                 raw = f.read(bytes_to_read)
                 arr = np.frombuffer(raw, dtype=np.float32)
                 t = torch.from_numpy(arr.copy()).view(shape)
-                # Debug print for weights
-                if "weight" in name or "w" in name: 
-                     print(f"Loaded {name} {tuple(shape)} norm: {t.norm().item():.4f}")
                 return t
 
             # 1. wte
