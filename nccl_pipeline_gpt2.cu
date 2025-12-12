@@ -341,6 +341,7 @@ typedef struct {
   // Activation gradients
   GradActTensors grads_acts;
   float *grads_acts_memory;
+  size_t num_grad_acts;
   size_t grad_act_sizes[NUM_BACKWARD_TENSORS];
 
   // Pipeline communication
@@ -1331,19 +1332,16 @@ void stage_forward(PipelineStage *stage, int mb_idx) {
     attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
     matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
     residual_forward(l_residual2, residual, l_attproj, B * T * C);
+    layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w,
                       l_ln2b, B, T, C);
-                      check_tensor_debug("forward_ln2", l_ln2, B * T * C,
-                                         stage->pipe_config.stage_id, false);
-                      matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C,
-                                     4 * C);
-                      gelu_forward(l_fch_gelu, l_fch, B * T * 4 * C);
-                      matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb,
-                                     B, T, 4 * C, C);
-                      residual_forward(l_residual3, l_residual2, l_fcproj,
-                                       B * T * C);
-                      check_tensor_debug("forward_residual3", l_residual3,
-                                         B * T * C, stage->pipe_config.stage_id,
-                                         false);
+    check_tensor_debug("forward_ln2", l_ln2, B * T * C,
+                       stage->pipe_config.stage_id, false);
+    matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4 * C);
+    gelu_forward(l_fch_gelu, l_fch, B * T * 4 * C);
+    matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4 * C, C);
+    residual_forward(l_residual3, l_residual2, l_fcproj, B * T * C);
+    check_tensor_debug("forward_residual3", l_residual3, B * T * C,
+                       stage->pipe_config.stage_id, false);
   }
 
   // Last stage: do final layernorm and classifier
@@ -1506,25 +1504,6 @@ void stage_backward(PipelineStage *stage, int mb_idx) {
     // Send gradient to previous stage
     cudaCheck(cudaMemcpy(stage->send_buffer, dresidual,
                          B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
-  }
-}
-
-// Accumulate gradients from this microbatch into the accumulated buffer
-void stage_accumulate_gradients(PipelineStage *stage) {
-  const int block_size = 256;
-  const int num_blocks = CEIL_DIV(stage->num_parameters, block_size);
-  accumulate_gradients_kernel<<<num_blocks, block_size>>>(
-      stage->grads_accumulated_memory, stage->grads_memory,
-      stage->num_parameters);
-  cudaCheck(cudaGetLastError());
-  cudaCheck(cudaDeviceSynchronize());
-
-  // DEBUG: Check accumulated gradient norm
-  float acc_grad_norm = compute_gradient_norm(stage->grads_accumulated_memory,
-                                              stage->num_parameters);
-  if (isnan(acc_grad_norm) || isinf(acc_grad_norm) || acc_grad_norm > 1e10) {
-    printf("[Stage %d] [WARNING] Abnormal accumulated gradient norm: %.6e\n",
-           stage->pipe_config.stage_id, acc_grad_norm);
   }
 }
 
