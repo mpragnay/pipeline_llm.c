@@ -345,6 +345,13 @@ def main():
     parser.add_argument('-g', type=int, default=64)
     args = parser.parse_args()
 
+    # Device info
+    dev_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    
+    # Disable TF32 to match C reference
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    
     # Print Params Table
     print("+-----------------------+----------------------------------------------------+")
     print("| Parameter             | Value                                              |")
@@ -361,8 +368,6 @@ def main():
     print(f"| genT                  | {args.g:<50} |")
     print("+-----------------------+----------------------------------------------------+")
 
-    # Device info
-    dev_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
     print(f"| device                | {dev_name:<50} |")
     print(f"| TF32                  | {'enabled' if torch.backends.cuda.matmul.allow_tf32 else 'disabled':<50} |")
     print("+-----------------------+----------------------------------------------------+")
