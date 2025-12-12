@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import tiktoken
 
 # -----------------------------------------------------------------------------
 # Utils & Config
@@ -132,10 +133,10 @@ class PipelineGPT2(nn.Module):
             
             # Header checks matching train_gpt2.c
             magic = header_ints[0]
-            version = header_ints[1]
             if magic != 20240326:
                 print("Bad magic model file")
                 sys.exit(1)
+            version = header_ints[1]
             if version != 3:
                 print("Bad version in model file")
                 sys.exit(1)
@@ -169,37 +170,41 @@ class PipelineGPT2(nn.Module):
                 self.wte = nn.Embedding(Vp, C).to(self.dev0)
                 self.lm_head = nn.Linear(C, Vp, bias=False).to(self.dev1)
 
-            def read_tensor(shape):
+            def read_tensor(shape, name):
                 numel = int(np.prod(shape))
                 bytes_to_read = numel * 4
                 raw = f.read(bytes_to_read)
                 arr = np.frombuffer(raw, dtype=np.float32)
-                return torch.from_numpy(arr.copy()).view(shape)
+                t = torch.from_numpy(arr.copy()).view(shape)
+                # Debug print for weights
+                if "weight" in name or "w" in name: 
+                     print(f"Loaded {name} {tuple(shape)} norm: {t.norm().item():.4f}")
+                return t
 
             # 1. wte
-            wte_data = read_tensor((Vp, C))
+            wte_data = read_tensor((Vp, C), "wte")
             with torch.no_grad():
                 self.wte.weight.copy_(wte_data.to(self.dev0))
                 self.lm_head.weight.copy_(wte_data.to(self.dev1))
 
             # 2. wpe
-            wpe_data = read_tensor((maxT, C))
+            wpe_data = read_tensor((maxT, C), "wpe")
             with torch.no_grad():
                 self.wpe.weight.copy_(wpe_data.to(self.dev0))
 
             # Read all big tensors first
-            ln1w = read_tensor((L, C))
-            ln1b = read_tensor((L, C))
-            qkvw = read_tensor((L, 3*C, C))
-            qkvb = read_tensor((L, 3*C))
-            attprojw = read_tensor((L, C, C))
-            attprojb = read_tensor((L, C))
-            ln2w = read_tensor((L, C))
-            ln2b = read_tensor((L, C))
-            fcw  = read_tensor((L, 4*C, C))
-            fcb  = read_tensor((L, 4*C))
-            fcprojw = read_tensor((L, C, 4*C))
-            fcprojb = read_tensor((L, C))
+            ln1w = read_tensor((L, C), "ln1w")
+            ln1b = read_tensor((L, C), "ln1b")
+            qkvw = read_tensor((L, 3*C, C), "qkvw")
+            qkvb = read_tensor((L, 3*C), "qkvb")
+            attprojw = read_tensor((L, C, C), "attprojw")
+            attprojb = read_tensor((L, C), "attprojb")
+            ln2w = read_tensor((L, C), "ln2w")
+            ln2b = read_tensor((L, C), "ln2b")
+            fcw  = read_tensor((L, 4*C, C), "fcw")
+            fcb  = read_tensor((L, 4*C), "fcb")
+            fcprojw = read_tensor((L, C, 4*C), "fcprojw")
+            fcprojb = read_tensor((L, C), "fcprojb")
             
             # Assign to layers
             for i in range(L):
@@ -225,8 +230,8 @@ class PipelineGPT2(nn.Module):
                      blocks[idx].mlp.c_proj.bias.copy_(fcprojb[i].to(dev))
 
             # lnf
-            lnfw = read_tensor((C,))
-            lnfb = read_tensor((C,))
+            lnfw = read_tensor((C,), "lnfw")
+            lnfb = read_tensor((C,), "lnfb")
             with torch.no_grad():
                 self.ln_f.weight.copy_(lnfw.to(self.dev1))
                 self.ln_f.bias.copy_(lnfb.to(self.dev1))
@@ -370,6 +375,9 @@ def main():
     model = PipelineGPT2(config, checkpoint_path="gpt2_124M.bin")
     print("+-----------------------+----------------------------------------------------+")
 
+    # Tokenizer
+    enc = tiktoken.get_encoding("gpt2")
+
     # DataLoaders
     train_loader = DataLoader(args.i, args.b, args.t, shuffle=True)
     val_loader = DataLoader(args.j, args.b, args.t, shuffle=False)
@@ -423,7 +431,12 @@ def main():
                      probs = F.softmax(next_logits, dim=-1)
                      # Random sample
                      idx = torch.multinomial(probs, 1).item()
-                     print(f"{idx} ", end="", flush=True)
+                     # Decode
+                     try:
+                        print(enc.decode([idx]), end="", flush=True)
+                     except:
+                        print(f"{idx} ", end="", flush=True)
+                        
                      ctx = torch.cat((ctx, torch.tensor([[idx]], device=model.dev0)), dim=1)
              print("\n---\n")
              model.train()
