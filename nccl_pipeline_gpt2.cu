@@ -1548,9 +1548,9 @@ void stage_update(PipelineStage *stage, float learning_rate, float beta1,
 
 // Zero out gradients
 void stage_zero_grad(PipelineStage *stage) {
+  // Only zero per-iteration gradients, NOT accumulated gradients!
+  // Accumulated gradients are zeroed after optimizer update
   cudaCheck(cudaMemset(stage->grads_memory, 0,
-                       stage->num_parameters * sizeof(float)));
-  cudaCheck(cudaMemset(stage->grads_accumulated_memory, 0,
                        stage->num_parameters * sizeof(float)));
 }
 
@@ -1850,7 +1850,7 @@ int main(int argc, char *argv[]) {
     if (rank == 0)
       printf("[DEBUG] Starting backward pass...\n");
 
-    // Zero out gradients before backward pass
+    // Zero per-iteration gradients (NOT accumulated gradients!)
     stage_zero_grad(&stage);
 
     // Execute backward pass (reverse order: Stage 1 first, then Stage 0)
@@ -1909,7 +1909,17 @@ int main(int argc, char *argv[]) {
     if (rank == 0)
       printf("[DEBUG] Accumulating gradients...\n");
 
+    // Debug: Check accumulated gradient norm BEFORE accumulation
+    float accum_norm_before = compute_gradient_norm(
+        stage.grads_accumulated_memory, stage.num_parameters);
+
     stage_accumulate_gradients(&stage);
+
+    // Debug: Check accumulated gradient norm AFTER accumulation
+    float accum_norm_after = compute_gradient_norm(
+        stage.grads_accumulated_memory, stage.num_parameters);
+    printf("[Stage %d] Accum grad norm: before=%.6e, after=%.6e\n", rank,
+           accum_norm_before, accum_norm_after);
 
     if (rank == 0)
       printf("[DEBUG] Gradient accumulation complete.\n");
@@ -1924,6 +1934,11 @@ int main(int argc, char *argv[]) {
     stage_update(&stage, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, iter + 1);
 
     cudaCheck(cudaDeviceSynchronize());
+
+    // 7. Zero ACCUMULATED gradients after optimizer update
+    cudaCheck(cudaMemset(stage.grads_accumulated_memory, 0,
+                         stage.num_parameters * sizeof(float)));
+
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (rank == 0)
