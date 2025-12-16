@@ -1693,10 +1693,12 @@ void gpt2_backward(GPT2 *model) {
       residual =
           acts.residual3 + (long)(part.num_layers - 1) * B * T * C + c_off;
 
-      float *l_logits = acts.logits + idx_off * Vp;
       float *l_losses = acts.losses + idx_off;
       int *l_targets = model->targets + idx_off;
-      fused_classifier3(l_logits, l_losses, l_output, l_targets, mb_size, T,
+
+      // fused_classifier3 computes gradients of logits.
+      // logits are stored in l_output (alias). dlosses=NULL implies 1.0/(B*T).
+      fused_classifier3(l_output, l_losses, NULL, l_targets, mb_size, T,
                         model->config.vocab_size, Vp);
 
       matmul_backward(l_bt4c, grads.wte, NULL, l_output, l_lnf, params.wte,
