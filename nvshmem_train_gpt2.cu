@@ -1657,8 +1657,14 @@ void gpt2_backward(GPT2 *model) {
     size_t offset_idx = (size_t)step * mb_size * T;
 
     // Debug Print
-    // if (my_pe == 1 && step == 0) printf("PE1 Step0: offset_elem=%zu
-    // mb_size=%d\n", offset_elem, mb_size);
+    if (my_pe == 1)
+      printf("PE1 Step%d: offset_elem=%zu mb_size=%d\n", step, offset_elem,
+             mb_size);
+
+    if (grads_acts.residual3 == NULL) {
+      printf("Error: grads_acts.residual3 is NULL\n");
+      exit(1);
+    }
 
     long idx_off = (long)step * mb_size * T;
     long c_off = idx_off * C;
@@ -1775,15 +1781,19 @@ void gpt2_backward(GPT2 *model) {
                       T, C, 3 * C);
       layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w,
                          l_ln1_mean, l_ln1_rstd, mb_size, T, C);
+
+      // Sync check inside loop to catch error early
+      // cudaCheck(cudaDeviceSynchronize());
     }
 
     // 2. Send to Prev PE
     if (my_pe > 0) {
       cudaCheck(cudaDeviceSynchronize());
       // Debug Print
-      // printf("PE%d Step%d PutMem: dest_off=%zu src=%p size=%zu pe=%d\n",
-      // my_pe, step, offset_elem, dresidual, mb_size * T * C * sizeof(float),
-      // my_pe - 1);
+      if (my_pe == 1)
+        printf("PE%d Step%d PutMem: dest_off=%zu src=%p size=%zu pe=%d\n",
+               my_pe, step, offset_elem, dresidual,
+               (size_t)mb_size * T * C * sizeof(float), my_pe - 1);
       nvshmem_putmem(model->nvshmem_grad_buffer + offset_elem, dresidual,
                      mb_size * T * C * sizeof(float), my_pe - 1);
       nvshmem_quiet();
