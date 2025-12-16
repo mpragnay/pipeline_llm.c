@@ -1656,6 +1656,10 @@ void gpt2_backward(GPT2 *model) {
     size_t offset_elem = (size_t)step * mb_size * T * C;
     size_t offset_idx = (size_t)step * mb_size * T;
 
+    // Debug Print
+    // if (my_pe == 1 && step == 0) printf("PE1 Step0: offset_elem=%zu
+    // mb_size=%d\n", offset_elem, mb_size);
+
     long idx_off = (long)step * mb_size * T;
     long c_off = idx_off * C;
     long c4_off = idx_off * 4 * C;
@@ -1776,6 +1780,10 @@ void gpt2_backward(GPT2 *model) {
     // 2. Send to Prev PE
     if (my_pe > 0) {
       cudaCheck(cudaDeviceSynchronize());
+      // Debug Print
+      // printf("PE%d Step%d PutMem: dest_off=%zu src=%p size=%zu pe=%d\n",
+      // my_pe, step, offset_elem, dresidual, mb_size * T * C * sizeof(float),
+      // my_pe - 1);
       nvshmem_putmem(model->nvshmem_grad_buffer + offset_elem, dresidual,
                      mb_size * T * C * sizeof(float), my_pe - 1);
       nvshmem_quiet();
