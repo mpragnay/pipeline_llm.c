@@ -30,8 +30,6 @@ Each GPU only holds its assigned layers' parameters and activations.
 // ----------------------------------------------------------------------------
 // CUDA utils
 
-#define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
-
 int counter = 0;
 
 void cudaCheck(cudaError_t error, const char *file, int line) {
@@ -1091,7 +1089,7 @@ __device__ void p2p_wait_flag(int *flags, int idx, int val) {
 }
 
 __device__ void p2p_signal_flag(int *flags, int idx, int val, int peer) {
-  nvshmem_int_p(val, flags + idx, peer);
+  nvshmem_int_p(flags + idx, val, peer);
 }
 
 void host_p2p_reset_flags(int *flags, int n) {
@@ -1410,10 +1408,11 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     // 1. Wait for Dependency (Receive)
     if (my_pe > 0) {
       // Wait for signal from PE i-1 for this microbatch
-      // Note: nvshmem_int_wait_until takes a pointer to LOCAL memory that is
-      // being updated by Remote
-      nvshmem_int_wait_until(model->nvshmem_fwd_flags + step, NVSHMEM_CMP_EQ,
-                             1);
+      // Host-side spin loop (since nvshmem_int_wait_until is device-only in
+      // some versions)
+      volatile int *flag_addr = model->nvshmem_fwd_flags + step;
+      while (*flag_addr != 1)
+        ;
       // nvshmem_fence() not strictly required for RAW dependency if using
       // wait_until, but safe.
     }
@@ -1523,7 +1522,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
       nvshmem_quiet(); // Ensure data visibility for the remote PE
 
       // Signal Next PE that this microbatch is ready
-      nvshmem_int_p(1, model->nvshmem_fwd_flags + step, my_pe + 1);
+      nvshmem_int_p(model->nvshmem_fwd_flags + step, 1, my_pe + 1);
     }
 
     // 3. Final PE Processing (Loss Calculation)
@@ -1658,8 +1657,9 @@ void gpt2_backward(GPT2 *model) {
     // 1. Wait for Dependency
     if (my_pe < n_pes - 1) {
       // Wait for signal from Next PE (i+1)
-      nvshmem_int_wait_until(model->nvshmem_bwd_flags + step, NVSHMEM_CMP_EQ,
-                             1);
+      volatile int *flag_addr = model->nvshmem_bwd_flags + step;
+      while (*flag_addr != 1)
+        ;
     }
 
     float *residual;
@@ -1775,7 +1775,7 @@ void gpt2_backward(GPT2 *model) {
                      mb_size * T * C * sizeof(float), my_pe - 1);
       nvshmem_quiet();
 
-      nvshmem_int_p(1, model->nvshmem_bwd_flags + step, my_pe - 1);
+      nvshmem_int_p(model->nvshmem_bwd_flags + step, 1, my_pe - 1);
     }
 
     // 3. First PE: Embedding
