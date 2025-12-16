@@ -1762,8 +1762,8 @@ void gpt2_backward(GPT2 *model) {
       float *scratch = acts.output + idx_off * max(3 * C, max(NH * T, Vp));
 
       // Only last PE has lnf allocated, others use scratch_btc
-      float *dl_btc =
-          (my_pe == n_pes - 1) ? acts.lnf + c_off : acts.scratch_btc + c_off;
+      // Use scratch buffer for gradients to avoid aliasing inputs (acts.lnf)
+      float *dl_btc = acts.scratch_btc + c_off;
 
       // Execute Kernels
       matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu,
