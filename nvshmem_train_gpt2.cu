@@ -1948,7 +1948,7 @@ void error_usage() {
   fprintf(stderr, "  -m <int>    val_max_steps (default = 20)\n");
   fprintf(stderr, "  -s <int>    sample_every (default = 20)\n");
   fprintf(stderr, "  -g <int>    genT (default = 64)\n");
-  fprintf(stderr, "  -n <int>    num_micro_batches (default = 1)\n");
+  fprintf(stderr, "  -c <int>    num_micro_batches (default = 1)\n");
   exit(EXIT_FAILURE);
 }
 
@@ -2027,7 +2027,7 @@ int main(int argc, char *argv[]) {
       sample_every = atoi(argv[i + 1]);
     else if (argv[i][1] == 'g')
       genT = atoi(argv[i + 1]);
-    else if (argv[i][1] == 'n')
+    else if (argv[i][1] == 'c')
       num_micro_batches = atoi(argv[i + 1]);
     else
       error_usage();
