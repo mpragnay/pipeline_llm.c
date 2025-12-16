@@ -23,9 +23,9 @@ Each GPU only holds its assigned layers' parameters and activations.
 #include <nvshmem.h>
 #include <nvshmemx.h>
 // our own utilities
-#include "llmc/utils.h"
-#include "llmc/tokenizer.h"
 #include "llmc/dataloader.h"
+#include "llmc/tokenizer.h"
+#include "llmc/utils.h"
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -49,7 +49,10 @@ void cublasCheck(cublasStatus_t status, const char *file, int line) {
     exit(EXIT_FAILURE);
   }
 }
-#define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
+#define cublasCheck(status)                                                    \
+  {                                                                            \
+    cublasCheck((status), __FILE__, __LINE__);                                 \
+  }
 
 static cublasComputeType_t cublas_compute_type;
 cublasHandle_t cublas_handle;
@@ -60,34 +63,36 @@ namespace cg = cooperative_groups;
 // Pipeline Partition Structure
 
 typedef struct {
-    int first_layer;      // First layer index (global)
-    int num_layers;       // Number of layers this PE handles
-    int has_embedding;    // 1 if this PE does embedding (PE 0)
-    int has_final_ln;     // 1 if this PE does final layernorm (PE 1)
+  int first_layer;   // First layer index (global)
+  int num_layers;    // Number of layers this PE handles
+  int has_embedding; // 1 if this PE does embedding (PE 0)
+  int has_final_ln;  // 1 if this PE does final layernorm (PE 1)
 } PipelinePartition;
 
-void get_partition_for_pe(PipelinePartition* part, int my_pe, int n_pes, int total_layers) {
-    int base_layers = total_layers / n_pes;
-    int remainder = total_layers % n_pes;
-    
-    // Distribute remainder: first 'remainder' PEs get one extra layer
-    part->num_layers = base_layers + (my_pe < remainder ? 1 : 0);
-    
-    // Calculate first_layer: sum of layers assigned to all previous PEs
-    part->first_layer = 0;
-    for (int pe = 0; pe < my_pe; pe++) {
-        part->first_layer += base_layers + (pe < remainder ? 1 : 0);
-    }
-    
-    part->has_embedding = (my_pe == 0);
-    part->has_final_ln = (my_pe == n_pes - 1);
+void get_partition_for_pe(PipelinePartition *part, int my_pe, int n_pes,
+                          int total_layers) {
+  int base_layers = total_layers / n_pes;
+  int remainder = total_layers % n_pes;
+
+  // Distribute remainder: first 'remainder' PEs get one extra layer
+  part->num_layers = base_layers + (my_pe < remainder ? 1 : 0);
+
+  // Calculate first_layer: sum of layers assigned to all previous PEs
+  part->first_layer = 0;
+  for (int pe = 0; pe < my_pe; pe++) {
+    part->first_layer += base_layers + (pe < remainder ? 1 : 0);
+  }
+
+  part->has_embedding = (my_pe == 0);
+  part->has_final_ln = (my_pe == n_pes - 1);
 }
 
 // ----------------------------------------------------------------------------
 // all the kernels
 
 // Kernel for accumulating gradients on GPU (used in NVSHMEM allreduce)
-__global__ void accumulate_grads_kernel(float *dst, const float *src, size_t n) {
+__global__ void accumulate_grads_kernel(float *dst, const float *src,
+                                        size_t n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n) {
     dst[idx] += src[idx];
@@ -141,7 +146,8 @@ __global__ void layernorm_forward_kernel3(
   cg::thread_block block = cg::this_thread_block();
   cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
   int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-  if (idx >= N) return;
+  if (idx >= N)
+    return;
 
   const float *x = inp + idx * C;
   float sum = 0.0f;
@@ -182,7 +188,8 @@ __global__ void permute_kernel(float *q, float *k, float *v, const float *inp,
     rest = rest % (N * d);
     int n = rest / d;
     int d_ = rest % d;
-    int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
+    int inp_idx =
+        (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
     q[idx] = __ldcs(&inp[inp_idx]);
     k[idx] = __ldcs(&inp[inp_idx + NH * d]);
     v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
@@ -200,14 +207,16 @@ __global__ void permute_kernel_backward(float *dinp, const float *dq,
     rest = rest % (N * d);
     int n = rest / d;
     int d_ = rest % d;
-    int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
+    int inp_idx =
+        (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
     dinp[inp_idx] = dq[idx];
     dinp[inp_idx + NH * d] = dk[idx];
     dinp[inp_idx + 2 * (NH * d)] = dv[idx];
   }
 }
 
-__global__ void unpermute_kernel(float *inp, float *out, int B, int N, int NH, int d) {
+__global__ void unpermute_kernel(float *inp, float *out, int B, int N, int NH,
+                                 int d) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < B * NH * N * d) {
     int b = idx / (NH * N * d);
@@ -249,8 +258,10 @@ __global__ void softmax_forward_kernel5(float *out, float inv_temperature,
   assert(T % 4 == 0);
   cg::thread_block block = cg::this_thread_block();
   cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-  int idx = (gridDim.x - blockIdx.x - 1) * warp.meta_group_size() + warp.meta_group_rank();
-  if (idx >= N * T) return;
+  int idx = (gridDim.x - blockIdx.x - 1) * warp.meta_group_size() +
+            warp.meta_group_rank();
+  if (idx >= N * T)
+    return;
   int own_pos = idx % T;
   int pos_by_4 = own_pos / 4;
 
@@ -275,7 +286,8 @@ __global__ void softmax_forward_kernel5(float *out, float inv_temperature,
     float old_maxval = maxval;
     maxval = fmaxf(maxval, x[4 * pos_by_4 + warp.thread_rank()]);
     sumval *= expf(inv_temperature * (old_maxval - maxval));
-    sumval += expf(inv_temperature * (x[4 * pos_by_4 + warp.thread_rank()] - maxval));
+    sumval +=
+        expf(inv_temperature * (x[4 * pos_by_4 + warp.thread_rank()] - maxval));
   }
 
   float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
@@ -289,7 +301,8 @@ __global__ void softmax_forward_kernel5(float *out, float inv_temperature,
   }
 }
 
-__global__ void residual_forward_kernel(float *out, float *inp1, float *inp2, int N) {
+__global__ void residual_forward_kernel(float *out, float *inp1, float *inp2,
+                                        int N) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < N) {
     out[idx] = __ldcs(&inp1[idx]) + __ldcs(&inp2[idx]);
@@ -316,7 +329,8 @@ __global__ void gelu_backward_kernel(float *dinp, const float *inp,
     float tanh_out = tanhf(tanh_arg);
     float coshf_out = coshf(tanh_arg);
     float sech_out = 1.0f / (coshf_out * coshf_out);
-    float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR *
+    float local_grad =
+        0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR *
                                        (1.0f + 3.0f * 0.044715f * x * x);
     dinp[i] = local_grad * dout[i];
   }
@@ -349,7 +363,8 @@ __global__ void matmul_backward_bias_kernel4(float *dbias, const float *dout,
 
 __global__ void layernorm_backward_kernel2(float *dinp, float *dweight,
                                            float *dbias, const float *dout,
-                                           const float *inp, const float *weight,
+                                           const float *inp,
+                                           const float *weight,
                                            const float *mean, const float *rstd,
                                            int B, int T, int C) {
   extern __shared__ float shared[];
@@ -357,7 +372,8 @@ __global__ void layernorm_backward_kernel2(float *dinp, float *dweight,
   cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
   int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
   int N = B * T;
-  if (idx >= N) return;
+  if (idx >= N)
+    return;
 
   int b = idx / T;
   int t = idx % T;
@@ -413,7 +429,8 @@ __global__ void layernorm_backward_kernel2(float *dinp, float *dweight,
 __global__ void softmax_autoregressive_backward_kernel(float *dpreatt,
                                                        const float *datt,
                                                        const float *att, int B,
-                                                       int T, int C, float scale) {
+                                                       int T, int C,
+                                                       float scale) {
   constexpr const int BlockSize = 256;
   constexpr int T_per_block = 4;
   cg::thread_block block = cg::this_thread_block();
@@ -433,7 +450,8 @@ __global__ void softmax_autoregressive_backward_kernel(float *dpreatt,
 
   for (int to = 0; to < T_per_block; ++to) {
     int t = t0 - to;
-    if (t < 0) return;
+    if (t < 0)
+      return;
     const float *att_bth = att + t * T;
     const float *datt_bth = datt + t * T;
     float *dpreatt_bth = dpreatt + t * T;
@@ -443,9 +461,11 @@ __global__ void softmax_autoregressive_backward_kernel(float *dpreatt,
       local_sum += att_bth[t2] * datt_bth[t2];
     }
 
-    block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+    block_acc[warp.meta_group_rank()] =
+        cg::reduce(warp, local_sum, cg::plus<float>{});
     block.sync();
-    local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+    local_sum =
+        cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
 
     for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
       float acc = __ldcs(att_bth + t3) * (__ldcs(datt_bth + t3) - local_sum);
@@ -462,9 +482,11 @@ __global__ void adamw_kernel2(float *params_memory, float *grads_memory,
                               float *m_memory, float *v_memory,
                               long num_parameters, float learning_rate,
                               float beta1, float beta2, float beta1_correction,
-                              float beta2_correction, float eps, float weight_decay) {
+                              float beta2_correction, float eps,
+                              float weight_decay) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= num_parameters) return;
+  if (i >= num_parameters)
+    return;
   float grad = grads_memory[i];
   float m = m_memory[i];
   float v = v_memory[i];
@@ -474,7 +496,8 @@ __global__ void adamw_kernel2(float *params_memory, float *grads_memory,
   v_memory[i] = v;
   m /= beta1_correction;
   v /= beta2_correction;
-  params_memory[i] -= learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
+  params_memory[i] -=
+      learning_rate * (m / (sqrtf(v) + eps) + weight_decay * params_memory[i]);
 }
 
 struct SoftmaxParams {
@@ -502,13 +525,15 @@ __device__ SoftmaxParams prepare_softmax_blockwide_nofloat4(
   int lane_id = threadIdx.x % 32;
 
   float warp_maxval = cg::reduce(warp, thread_maxval, cg::greater<float>{});
-  if (lane_id == 0) shared_maxval[warp_id] = warp_maxval;
+  if (lane_id == 0)
+    shared_maxval[warp_id] = warp_maxval;
   __syncthreads();
   warp_maxval = (lane_id < num_warps) ? shared_maxval[lane_id] : -FLT_MAX;
   float block_maxval = cg::reduce(warp, warp_maxval, cg::greater<float>{});
   thread_sumval *= expf(thread_maxval - block_maxval);
   float warp_sumval = cg::reduce(warp, thread_sumval, cg::plus<float>{});
-  if (lane_id == 0) shared_sumval[warp_id] = warp_sumval;
+  if (lane_id == 0)
+    shared_sumval[warp_id] = warp_sumval;
   __syncthreads();
   warp_sumval = (lane_id < num_warps) ? shared_sumval[lane_id] : 0.0f;
   float block_sumval = cg::reduce(warp, warp_sumval, cg::plus<float>{});
@@ -524,7 +549,8 @@ __global__ void fused_classifier_kernel3(float *logits, float *losses,
   int idx = blockIdx.x;
   int ix = targets[idx];
 
-  SoftmaxParams sp = prepare_softmax_blockwide_nofloat4(warp, idx, logits, V, P);
+  SoftmaxParams sp =
+      prepare_softmax_blockwide_nofloat4(warp, idx, logits, V, P);
 
   if (threadIdx.x == 0) {
     float prob = expf(logits[idx * P + ix] - sp.Offset) * sp.Scale;
@@ -637,7 +663,8 @@ void encoder_backward(float *dwte, float *dwpe, const float *dout,
   const int N = B * T * C;
   const int block_size = 256;
   const int grid_size = CEIL_DIV(N, block_size);
-  encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C);
+  encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B,
+                                                     T, C);
   cudaCheck(cudaGetLastError());
 }
 
@@ -646,14 +673,16 @@ void layernorm_forward(float *out, float *mean, float *rstd, float *inp,
   const int block_size = 512;
   const int N = B * T;
   const int grid_size = CEIL_DIV(N * 32, block_size);
-  layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+  layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp,
+                                                       weight, bias, N, C);
   cudaCheck(cudaGetLastError());
 }
 
 void matmul_forward(float *out, const float *inp, const float *weight,
                     const float *bias, int B, int T, int C, int OC) {
   int sqrt_block_size = 16;
-  dim3 gridDim(CEIL_DIV(B * T, 8 * sqrt_block_size), CEIL_DIV(OC, 8 * sqrt_block_size));
+  dim3 gridDim(CEIL_DIV(B * T, 8 * sqrt_block_size),
+               CEIL_DIV(OC, 8 * sqrt_block_size));
   dim3 blockDim(sqrt_block_size, sqrt_block_size);
   matmul_forward_kernel4<<<gridDim, blockDim>>>(out, inp, weight, bias, C, OC);
   cudaCheck(cudaGetLastError());
@@ -683,7 +712,8 @@ void attention_forward(float *out, float *qkvr, float *att, float *inp, int B,
 
   float scale = 1.0 / sqrtf(HS);
   int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
-  softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
+  softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt,
+                                                             B * NH, T);
   cudaCheck(cudaGetLastError());
 
   float *vaccum = inp;
@@ -710,7 +740,8 @@ void gelu_forward(float *out, const float *inp, int N) {
   cudaCheck(cudaGetLastError());
 }
 
-void gelu_backward(float *dinp, const float *inp, const float *dout, const int N) {
+void gelu_backward(float *dinp, const float *inp, const float *dout,
+                   const int N) {
   const int block_size = 128;
   const int grid_size = CEIL_DIV(N, block_size);
   gelu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, dout, N);
@@ -728,7 +759,9 @@ void matmul_backward(float *dinp, float *dweight, float *dbias, float *dout,
   if (dbias != NULL) {
     const int block_size = 1024;
     const int grid_size = OC / 32;
-    matmul_backward_bias_kernel4<<<grid_size, block_size, block_size * sizeof(float)>>>(dbias, dout, B, T, OC);
+    matmul_backward_bias_kernel4<<<grid_size, block_size,
+                                   block_size * sizeof(float)>>>(dbias, dout, B,
+                                                                 T, OC);
     cudaCheck(cudaGetLastError());
   }
 }
@@ -762,7 +795,8 @@ void attention_backward(float *dinp, float *dqkvr, float *dpreatt, float *datt,
   dk = dqkvr + 1 * B * T * C;
   dv = dqkvr + 2 * B * T * C;
   int num_blocks = CEIL_DIV(B * T * C, block_size);
-  unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH, HS);
+  unpermute_kernel_backward<<<num_blocks, block_size>>>(scratch, dout, B, T, NH,
+                                                        HS);
   cudaCheck(cudaGetLastError());
   cublasCheck(cublasSgemmStridedBatched(
       cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &one, v, HS, T * HS,
@@ -782,7 +816,8 @@ void attention_backward(float *dinp, float *dqkvr, float *dpreatt, float *datt,
       cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, q, HS, T * HS,
       dpreatt, T, T * T, &zero, dk, HS, T * HS, B * NH));
   num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
-  permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
+  permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T,
+                                                      NH, HS);
   cudaCheck(cudaGetLastError());
 }
 
@@ -791,7 +826,8 @@ void fused_classifier3(float *logits, float *losses, const float *dlosses,
   const int block_size = 1024;
   const int N = B * T;
   const int grid_size = N;
-  fused_classifier_kernel3<<<grid_size, block_size>>>(logits, losses, NULL, dlosses, targets, B, T, V, P);
+  fused_classifier_kernel3<<<grid_size, block_size>>>(
+      logits, losses, NULL, dlosses, targets, B, T, V, P);
   cudaCheck(cudaGetLastError());
 }
 
@@ -853,14 +889,14 @@ void fill_in_parameter_sizes(size_t *param_sizes, GPT2Config config) {
 
 // Partitioned parameter sizes (for allocation)
 void fill_in_parameter_sizes_partitioned(size_t *param_sizes, GPT2Config config,
-                                          PipelinePartition *part) {
+                                         PipelinePartition *part) {
   int Vp = config.padded_vocab_size;
   int C = config.channels;
   int maxT = config.max_seq_len;
   int L = part->num_layers;
 
-  param_sizes[0] = Vp * C;                              // wte - all PEs
-  param_sizes[1] = part->has_embedding ? maxT * C : 0;  // wpe
+  param_sizes[0] = Vp * C;                             // wte - all PEs
+  param_sizes[1] = part->has_embedding ? maxT * C : 0; // wpe
   param_sizes[2] = L * C;
   param_sizes[3] = L * C;
   param_sizes[4] = L * (3 * C) * C;
@@ -885,7 +921,8 @@ float *malloc_and_point_parameters(ParameterTensors *params,
   }
   float *params_memory;
   if (on_device) {
-    cudaCheck(cudaMalloc((void **)&params_memory, num_parameters * sizeof(float)));
+    cudaCheck(
+        cudaMalloc((void **)&params_memory, num_parameters * sizeof(float)));
   } else {
     params_memory = (float *)mallocCheck(num_parameters * sizeof(float));
   }
@@ -904,32 +941,33 @@ float *malloc_and_point_parameters(ParameterTensors *params,
 
 #define NUM_ACTIVATION_TENSORS 22
 typedef struct {
-  float *encoded;   // (B, T, C) - only PE 0
-  float *ln1;       // (L_local, B, T, C)
-  float *ln1_mean;  // (L_local, B, T)
-  float *ln1_rstd;  // (L_local, B, T)
-  float *atty;      // (L_local, B, T, C)
-  float *att;       // (L_local, B, NH, T, T)
-  float *attproj;   // (L_local, B, T, C)
-  float *residual2; // (L_local, B, T, C)
-  float *ln2;       // (L_local, B, T, C)
-  float *ln2_mean;  // (L_local, B, T)
-  float *ln2_rstd;  // (L_local, B, T)
-  float *fch;       // (L_local, B, T, 4*C)
-  float *fch_gelu;  // (L_local, B, T, 4*C)
-  float *fcproj;    // (L_local, B, T, C)
-  float *residual3; // (L_local, B, T, C)
-  float *lnf;       // (B, T, C) - only final PE
-  float *lnf_mean;  // (B, T) - only final PE
-  float *lnf_rstd;  // (B, T) - only final PE
-  float *losses;    // (B, T) - only final PE
-  float *qkvr;      // (L_local, B, T, 3*C)
-  float *output;    // scratch buffer
+  float *encoded;     // (B, T, C) - only PE 0
+  float *ln1;         // (L_local, B, T, C)
+  float *ln1_mean;    // (L_local, B, T)
+  float *ln1_rstd;    // (L_local, B, T)
+  float *atty;        // (L_local, B, T, C)
+  float *att;         // (L_local, B, NH, T, T)
+  float *attproj;     // (L_local, B, T, C)
+  float *residual2;   // (L_local, B, T, C)
+  float *ln2;         // (L_local, B, T, C)
+  float *ln2_mean;    // (L_local, B, T)
+  float *ln2_rstd;    // (L_local, B, T)
+  float *fch;         // (L_local, B, T, 4*C)
+  float *fch_gelu;    // (L_local, B, T, 4*C)
+  float *fcproj;      // (L_local, B, T, C)
+  float *residual3;   // (L_local, B, T, C)
+  float *lnf;         // (B, T, C) - only final PE
+  float *lnf_mean;    // (B, T) - only final PE
+  float *lnf_rstd;    // (B, T) - only final PE
+  float *losses;      // (B, T) - only final PE
+  float *qkvr;        // (L_local, B, T, 3*C)
+  float *output;      // scratch buffer
   float *scratch_btc; // (B, T, C) - extra scratch for backward on PE 0
 } ActivationTensors;
 
 void fill_in_activation_sizes_partitioned(size_t *act_sizes, int B, int T,
-                                           GPT2Config config, PipelinePartition *part) {
+                                          GPT2Config config,
+                                          PipelinePartition *part) {
   size_t Vp = config.padded_vocab_size;
   size_t L = part->num_layers;
   size_t NH = config.num_heads;
@@ -956,7 +994,7 @@ void fill_in_activation_sizes_partitioned(size_t *act_sizes, int B, int T,
   act_sizes[18] = part->has_final_ln ? B * T : 0;
   act_sizes[19] = L * B * T * 3 * C;
   act_sizes[20] = B * T * max(3 * C, max(NH * T, Vp));
-  act_sizes[21] = B * T * C;  // scratch_btc for backward
+  act_sizes[21] = B * T * C; // scratch_btc for backward
 }
 
 #define NUM_BACKWARD_TENSORS 3
@@ -966,7 +1004,8 @@ typedef struct {
   float *residual3;
 } GradActTensors;
 
-void fill_in_grad_act_sizes(size_t *act_sizes, int B, int T, GPT2Config config) {
+void fill_in_grad_act_sizes(size_t *act_sizes, int B, int T,
+                            GPT2Config config) {
   size_t NH = config.num_heads;
   size_t C = config.channels;
   act_sizes[0] = B * T * 4 * C;
@@ -989,19 +1028,20 @@ float *malloc_and_point(float **targets[], const size_t *act_sizes, int n) {
   return acts_memory;
 }
 
-float *malloc_and_point_activations(ActivationTensors *acts, const size_t *act_sizes) {
-  float **ptrs[] = {&acts->encoded,  &acts->ln1,       &acts->ln1_mean,
-                    &acts->ln1_rstd, &acts->atty,      &acts->att,
-                    &acts->attproj,  &acts->residual2, &acts->ln2,
-                    &acts->ln2_mean, &acts->ln2_rstd,  &acts->fch,
-                    &acts->fch_gelu, &acts->fcproj,    &acts->residual3,
-                    &acts->lnf,      &acts->lnf_mean,  &acts->lnf_rstd,
-                    &acts->losses,   &acts->qkvr,      &acts->output,
-                    &acts->scratch_btc};
+float *malloc_and_point_activations(ActivationTensors *acts,
+                                    const size_t *act_sizes) {
+  float **ptrs[] = {
+      &acts->encoded,  &acts->ln1,        &acts->ln1_mean,  &acts->ln1_rstd,
+      &acts->atty,     &acts->att,        &acts->attproj,   &acts->residual2,
+      &acts->ln2,      &acts->ln2_mean,   &acts->ln2_rstd,  &acts->fch,
+      &acts->fch_gelu, &acts->fcproj,     &acts->residual3, &acts->lnf,
+      &acts->lnf_mean, &acts->lnf_rstd,   &acts->losses,    &acts->qkvr,
+      &acts->output,   &acts->scratch_btc};
   return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
 }
 
-float *malloc_and_point_backward(GradActTensors *acts, const size_t *act_sizes) {
+float *malloc_and_point_backward(GradActTensors *acts,
+                                 const size_t *act_sizes) {
   float **ptrs[] = {&acts->bt4c, &acts->preatt, &acts->residual3};
   return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
@@ -1033,12 +1073,35 @@ typedef struct {
   float *nvshmem_act_buffer;
   float *nvshmem_grad_buffer;
   size_t nvshmem_buffer_size;
-  float *nvshmem_wte_grad_buffer;  // symmetric buffer for wte gradient allreduce
-  int *nvshmem_token_buffer;       // symmetric buffer for token broadcast
+  float *nvshmem_wte_grad_buffer; // symmetric buffer for wte gradient allreduce
+  int *nvshmem_token_buffer;      // symmetric buffer for token broadcast
+
+  // Microbatching
+  int num_micro_batches;
+  int micro_batch_size;
+  int *nvshmem_fwd_flags; // symmetric buffer for forward pass ready flags
+  int *nvshmem_bwd_flags; // symmetric buffer for backward pass ready flags
 } GPT2;
 
-void gpt2_build_from_checkpoint_partitioned(GPT2 *model, const char *checkpoint_path,
-                                             PipelinePartition *part) {
+// ----------------------------------------------------------------------------
+// P2P Signaling Helpers
+
+__device__ void p2p_wait_flag(int *flags, int idx, int val) {
+  nvshmem_int_wait_until(flags + idx, NVSHMEM_CMP_EQ, val);
+}
+
+__device__ void p2p_signal_flag(int *flags, int idx, int val, int peer) {
+  nvshmem_int_p(val, flags + idx, peer);
+}
+
+void host_p2p_reset_flags(int *flags, int n) {
+  cudaCheck(cudaMemset(flags, 0, n * sizeof(int)));
+  nvshmem_barrier_all();
+}
+
+void gpt2_build_from_checkpoint_partitioned(GPT2 *model,
+                                            const char *checkpoint_path,
+                                            PipelinePartition *part) {
   int my_pe = nvshmem_my_pe();
 
   FILE *model_file = fopenCheck(checkpoint_path, "rb");
@@ -1079,21 +1142,26 @@ void gpt2_build_from_checkpoint_partitioned(GPT2 *model, const char *checkpoint_
   }
   model->num_parameters = num_parameters;
 
-  model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
+  model->params_memory =
+      malloc_and_point_parameters(&model->params, model->param_sizes, 1);
 
-  printf("[PE %d] allocated %zu MiB for partitioned parameters (layers %d-%d)\n",
-         my_pe, (num_parameters * sizeof(float)) >> 20,
-         part->first_layer, part->first_layer + part->num_layers - 1);
+  printf(
+      "[PE %d] allocated %zu MiB for partitioned parameters (layers %d-%d)\n",
+      my_pe, (num_parameters * sizeof(float)) >> 20, part->first_layer,
+      part->first_layer + part->num_layers - 1);
 
   size_t header_size = 256 * sizeof(int);
 
   // Helper to read a range of floats from file
   auto read_range = [&](float *gpu_dst, size_t file_elem_offset, size_t count) {
-    if (count == 0) return;
+    if (count == 0)
+      return;
     float *cpu_buf = (float *)mallocCheck(count * sizeof(float));
-    fseekCheck(model_file, header_size + file_elem_offset * sizeof(float), SEEK_SET);
+    fseekCheck(model_file, header_size + file_elem_offset * sizeof(float),
+               SEEK_SET);
     freadCheck(cpu_buf, sizeof(float), count, model_file);
-    cudaCheck(cudaMemcpy(gpu_dst, cpu_buf, count * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(gpu_dst, cpu_buf, count * sizeof(float),
+                         cudaMemcpyHostToDevice));
     free(cpu_buf);
   };
 
@@ -1112,51 +1180,63 @@ void gpt2_build_from_checkpoint_partitioned(GPT2 *model, const char *checkpoint_
   file_offset += full_param_sizes[1];
 
   // 2: ln1w
-  read_range(model->params.ln1w, file_offset + layer_start * C, layer_count * C);
+  read_range(model->params.ln1w, file_offset + layer_start * C,
+             layer_count * C);
   file_offset += full_param_sizes[2];
 
   // 3: ln1b
-  read_range(model->params.ln1b, file_offset + layer_start * C, layer_count * C);
+  read_range(model->params.ln1b, file_offset + layer_start * C,
+             layer_count * C);
   file_offset += full_param_sizes[3];
 
   // 4: qkvw
-  read_range(model->params.qkvw, file_offset + layer_start * 3 * C * C, layer_count * 3 * C * C);
+  read_range(model->params.qkvw, file_offset + layer_start * 3 * C * C,
+             layer_count * 3 * C * C);
   file_offset += full_param_sizes[4];
 
   // 5: qkvb
-  read_range(model->params.qkvb, file_offset + layer_start * 3 * C, layer_count * 3 * C);
+  read_range(model->params.qkvb, file_offset + layer_start * 3 * C,
+             layer_count * 3 * C);
   file_offset += full_param_sizes[5];
 
   // 6: attprojw
-  read_range(model->params.attprojw, file_offset + layer_start * C * C, layer_count * C * C);
+  read_range(model->params.attprojw, file_offset + layer_start * C * C,
+             layer_count * C * C);
   file_offset += full_param_sizes[6];
 
   // 7: attprojb
-  read_range(model->params.attprojb, file_offset + layer_start * C, layer_count * C);
+  read_range(model->params.attprojb, file_offset + layer_start * C,
+             layer_count * C);
   file_offset += full_param_sizes[7];
 
   // 8: ln2w
-  read_range(model->params.ln2w, file_offset + layer_start * C, layer_count * C);
+  read_range(model->params.ln2w, file_offset + layer_start * C,
+             layer_count * C);
   file_offset += full_param_sizes[8];
 
   // 9: ln2b
-  read_range(model->params.ln2b, file_offset + layer_start * C, layer_count * C);
+  read_range(model->params.ln2b, file_offset + layer_start * C,
+             layer_count * C);
   file_offset += full_param_sizes[9];
 
   // 10: fcw
-  read_range(model->params.fcw, file_offset + layer_start * 4 * C * C, layer_count * 4 * C * C);
+  read_range(model->params.fcw, file_offset + layer_start * 4 * C * C,
+             layer_count * 4 * C * C);
   file_offset += full_param_sizes[10];
 
   // 11: fcb
-  read_range(model->params.fcb, file_offset + layer_start * 4 * C, layer_count * 4 * C);
+  read_range(model->params.fcb, file_offset + layer_start * 4 * C,
+             layer_count * 4 * C);
   file_offset += full_param_sizes[11];
 
   // 12: fcprojw
-  read_range(model->params.fcprojw, file_offset + layer_start * C * 4 * C, layer_count * C * 4 * C);
+  read_range(model->params.fcprojw, file_offset + layer_start * C * 4 * C,
+             layer_count * C * 4 * C);
   file_offset += full_param_sizes[12];
 
   // 13: fcprojb
-  read_range(model->params.fcprojb, file_offset + layer_start * C, layer_count * C);
+  read_range(model->params.fcprojb, file_offset + layer_start * C,
+             layer_count * C);
   file_offset += full_param_sizes[13];
 
   // 14: lnfw - only final PE
@@ -1199,18 +1279,32 @@ void gpt2_allocate_nvshmem_buffers(GPT2 *model) {
   size_t buffer_elements = B * T * C;
   model->nvshmem_buffer_size = buffer_elements * sizeof(float);
 
-  model->nvshmem_act_buffer = (float *)nvshmem_malloc(model->nvshmem_buffer_size);
-  model->nvshmem_grad_buffer = (float *)nvshmem_malloc(model->nvshmem_buffer_size);
+  model->nvshmem_act_buffer =
+      (float *)nvshmem_malloc(model->nvshmem_buffer_size);
+  model->nvshmem_grad_buffer =
+      (float *)nvshmem_malloc(model->nvshmem_buffer_size);
 
-  // Allocate symmetric buffer for wte gradient allreduce (needs space for all PEs' contributions)
+  // Allocate symmetric buffer for wte gradient allreduce (needs space for all
+  // PEs' contributions)
   size_t wte_grad_size = (size_t)Vp * C * sizeof(float);
-  model->nvshmem_wte_grad_buffer = (float *)nvshmem_malloc(wte_grad_size * n_pes);
+  model->nvshmem_wte_grad_buffer =
+      (float *)nvshmem_malloc(wte_grad_size * n_pes);
 
   // Allocate symmetric buffer for token broadcast during generation
   model->nvshmem_token_buffer = (int *)nvshmem_malloc(sizeof(int));
 
+  // Allocate microbatch flags
+  if (model->num_micro_batches < 1)
+    model->num_micro_batches = 1;
+  model->nvshmem_fwd_flags =
+      (int *)nvshmem_malloc(model->num_micro_batches * sizeof(int));
+  model->nvshmem_bwd_flags =
+      (int *)nvshmem_malloc(model->num_micro_batches * sizeof(int));
+
   if (model->nvshmem_act_buffer == NULL || model->nvshmem_grad_buffer == NULL ||
-      model->nvshmem_wte_grad_buffer == NULL || model->nvshmem_token_buffer == NULL) {
+      model->nvshmem_wte_grad_buffer == NULL ||
+      model->nvshmem_token_buffer == NULL || model->nvshmem_fwd_flags == NULL ||
+      model->nvshmem_bwd_flags == NULL) {
     printf("[PE %d] Error: Failed to allocate NVSHMEM buffers\n", my_pe);
     exit(EXIT_FAILURE);
   }
@@ -1218,9 +1312,16 @@ void gpt2_allocate_nvshmem_buffers(GPT2 *model) {
   printf("[PE %d] allocated %zu MiB for NVSHMEM buffers\n", my_pe,
          (2 * model->nvshmem_buffer_size + wte_grad_size * n_pes) >> 20);
 
-  cudaCheck(cudaMemset(model->nvshmem_act_buffer, 0, model->nvshmem_buffer_size));
-  cudaCheck(cudaMemset(model->nvshmem_grad_buffer, 0, model->nvshmem_buffer_size));
-  cudaCheck(cudaMemset(model->nvshmem_wte_grad_buffer, 0, wte_grad_size * n_pes));
+  cudaCheck(
+      cudaMemset(model->nvshmem_act_buffer, 0, model->nvshmem_buffer_size));
+  cudaCheck(
+      cudaMemset(model->nvshmem_grad_buffer, 0, model->nvshmem_buffer_size));
+  cudaCheck(
+      cudaMemset(model->nvshmem_wte_grad_buffer, 0, wte_grad_size * n_pes));
+  cudaCheck(cudaMemset(model->nvshmem_fwd_flags, 0,
+                       model->num_micro_batches * sizeof(int)));
+  cudaCheck(cudaMemset(model->nvshmem_bwd_flags, 0,
+                       model->num_micro_batches * sizeof(int)));
 }
 
 void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
@@ -1247,147 +1348,242 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
   if (model->acts_memory == NULL) {
     model->batch_size = B;
     model->seq_len = T;
-    fill_in_activation_sizes_partitioned(model->act_sizes, B, T, model->config, &part);
+    // NOTE: This assumes 'num_micro_batches' was set before calling forward for
+    // first time. It should be set in main.
+    // fill_in_activation_sizes_partitioned uses B (total). That is correct.
+    fill_in_activation_sizes_partitioned(model->act_sizes, B, T, model->config,
+                                         &part);
     size_t num_activations = 0;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
       num_activations += model->act_sizes[i];
     }
     model->num_activations = num_activations;
-    model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
+    model->acts_memory =
+        malloc_and_point_activations(&model->acts, model->act_sizes);
     printf("[PE %d] allocated %zu MiB for activations\n", my_pe,
            (num_activations * sizeof(float)) >> 20);
     cudaCheck(cudaMalloc((void **)&model->inputs, B * T * sizeof(int)));
     cudaCheck(cudaMalloc((void **)&model->targets, B * T * sizeof(int)));
-    cudaCheck(cudaMallocHost((void **)&model->cpu_losses, B * T * sizeof(float)));
+    cudaCheck(
+        cudaMallocHost((void **)&model->cpu_losses, B * T * sizeof(float)));
   } else {
     if (B != model->batch_size || T != model->seq_len) {
-      printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
+      printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size,
+             model->seq_len, B, T);
       exit(EXIT_FAILURE);
     }
   }
 
-  cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
+  // Copy inputs/targets (Entire Batch)
+  cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int),
+                       cudaMemcpyHostToDevice));
   if (targets != NULL) {
-    cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int),
+                         cudaMemcpyHostToDevice));
   }
 
   ParameterTensors params = model->params;
   ActivationTensors acts = model->acts;
-  float *residual;
 
-  // Pipeline forward pass - process PEs sequentially
-  for (int target_pe = 0; target_pe < n_pes; target_pe++) {
-    if (my_pe == target_pe) {
-      // PE 0: Do embedding
-      if (my_pe == 0) {
-        encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
-      }
+  int M = model->num_micro_batches;
+  if (B % M != 0) {
+    if (my_pe == 0)
+      printf("Error: Batch size %d not divisible by microbatches %d\n", B, M);
+    exit(EXIT_FAILURE);
+  }
+  int mb_size = B / M;
+  model->micro_batch_size = mb_size;
 
-      // Non-first PEs: receive activations from previous PE
-      if (my_pe > 0) {
-        cudaCheck(cudaMemcpy(model->nvshmem_act_buffer, model->nvshmem_act_buffer,
-                             0, cudaMemcpyDeviceToDevice)); // sync point
-      }
+  // Reset forward flags at start of global batch
+  host_p2p_reset_flags(model->nvshmem_fwd_flags, M);
 
-      // Process this PE's layers
-      for (int l = 0; l < part.num_layers; l++) {
-        if (l == 0) {
-          if (my_pe == 0) {
-            residual = acts.encoded;
-          } else {
-            residual = model->nvshmem_act_buffer;
-          }
-        } else {
-          residual = acts.residual3 + (l - 1) * B * T * C;
-        }
+  // GPipe Loop over Microbatches
+  for (int step = 0; step < M; step++) {
+    // These offsets are for the current microbatch within the full allocated
+    // tensor
+    long idx_off = (long)step * mb_size * T; // For [B, T] tensors
+    long c_off = idx_off * C;                // For [B, T, C] tensors
+    long c4_off = idx_off * 4 * C;           // For [B, T, 4C] tensors
+    long nh_off =
+        (long)step * mb_size * NH * T; // For [B, NH, T, T] tensors (att)
 
-        float *l_ln1w = params.ln1w + l * C;
-        float *l_ln1b = params.ln1b + l * C;
-        float *l_qkvw = params.qkvw + l * 3 * C * C;
-        float *l_qkvb = params.qkvb + l * 3 * C;
-        float *l_attprojw = params.attprojw + l * C * C;
-        float *l_attprojb = params.attprojb + l * C;
-        float *l_ln2w = params.ln2w + l * C;
-        float *l_ln2b = params.ln2b + l * C;
-        float *l_fcw = params.fcw + l * 4 * C * C;
-        float *l_fcb = params.fcb + l * 4 * C;
-        float *l_fcprojw = params.fcprojw + l * C * 4 * C;
-        float *l_fcprojb = params.fcprojb + l * C;
-
-        float *l_ln1 = acts.ln1 + l * B * T * C;
-        float *l_ln1_mean = acts.ln1_mean + l * B * T;
-        float *l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float *l_qkvr = acts.qkvr + l * B * T * 3 * C;
-        float *l_atty = acts.atty + l * B * T * C;
-        float *l_att = acts.att + l * B * NH * T * T;
-        float *l_attproj = acts.attproj + l * B * T * C;
-        float *l_residual2 = acts.residual2 + l * B * T * C;
-        float *l_ln2 = acts.ln2 + l * B * T * C;
-        float *l_ln2_mean = acts.ln2_mean + l * B * T;
-        float *l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        float *l_fch = acts.fch + l * B * T * 4 * C;
-        float *l_fch_gelu = acts.fch_gelu + l * B * T * 4 * C;
-        float *l_fcproj = acts.fcproj + l * B * T * C;
-        float *l_residual3 = acts.residual3 + l * B * T * C;
-        float *scratch = acts.output;
-
-        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3 * C);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
-        matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        residual_forward(l_residual2, residual, l_attproj, B * T * C);
-        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4 * C);
-        gelu_forward(l_fch_gelu, l_fch, B * T * 4 * C);
-        matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4 * C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B * T * C);
-      }
-
-      // Non-last PEs: send activations to next PE
-      if (my_pe < n_pes - 1) {
-        float *last_output = acts.residual3 + (part.num_layers - 1) * B * T * C;
-        cudaCheck(cudaDeviceSynchronize());
-        nvshmem_putmem(model->nvshmem_act_buffer, last_output, B * T * C * sizeof(float), my_pe + 1);
-        nvshmem_quiet();
-      }
-
-      // Last PE: final layernorm + classifier + loss
-      if (my_pe == n_pes - 1) {
-        residual = acts.residual3 + (part.num_layers - 1) * B * T * C;
-        layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual,
-                          params.lnfw, params.lnfb, B, T, C);
-        matmul_forward(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
-
-        if (targets != NULL) {
-          fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, Vp);
-          cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float),
-                               cudaMemcpyDeviceToHost));
-          float mean_loss = 0.0f;
-          for (int i = 0; i < B * T; i++) {
-            mean_loss += model->cpu_losses[i];
-          }
-          mean_loss /= B * T;
-          model->mean_loss = mean_loss;
-        } else {
-          model->mean_loss = -1.0f;
-        }
-      } else {
-        // Non-final PEs: set placeholder for backward pass check
-        model->mean_loss = (targets != NULL) ? 0.0f : -1.0f;
-      }
+    // 1. Wait for Dependency (Receive)
+    if (my_pe > 0) {
+      // Wait for signal from PE i-1 for this microbatch
+      // Note: nvshmem_int_wait_until takes a pointer to LOCAL memory that is
+      // being updated by Remote
+      nvshmem_int_wait_until(model->nvshmem_fwd_flags + step, NVSHMEM_CMP_EQ,
+                             1);
+      // nvshmem_fence() not strictly required for RAW dependency if using
+      // wait_until, but safe.
     }
 
-    // Synchronize all PEs before next iteration
-    nvshmem_barrier_all();
+    // Pointer setup for residual input to the first layer of this PE
+    float *residual;
+    if (my_pe == 0) {
+      // PE0 encodes directly into its allocated acts.encoded buffer
+      float *out_ptr = acts.encoded + c_off;
+      encoder_forward(out_ptr, model->inputs + idx_off, params.wte, params.wpe,
+                      mb_size, T, C);
+      residual = out_ptr;
+    } else {
+      // Other PEs read from THEIR OWN nvshmem buffer, which PE i-1 wrote to.
+      // The nvshmem_act_buffer is B*T*C, so we just use the offset.
+      residual = model->nvshmem_act_buffer + c_off;
+    }
+
+    // Layers Loop
+    for (int l = 0; l < part.num_layers; l++) {
+      // The base pointers (e.g. acts.ln1) are allocated for the full batch [L,
+      // B_total, T, C] So acts.ln1 + (long)l * B * T * C gets us the Layer
+      // start for the full batch. Then + c_off gets us the microbatch start
+      // within that layer's allocation.
+
+      if (l == 0) {
+        // residual already set for the first layer
+      } else {
+        // For subsequent layers, residual comes from the previous layer's
+        // output (residual3)
+        residual = acts.residual3 + (long)(l - 1) * B * T * C + c_off;
+      }
+
+      // Activation pointers for the current layer 'l' and current microbatch
+      // 'step'
+      float *l_ln1 = acts.ln1 + (long)l * B * T * C + c_off;
+      float *l_ln1_mean = acts.ln1_mean + (long)l * B * T + idx_off;
+      float *l_ln1_rstd = acts.ln1_rstd + (long)l * B * T + idx_off;
+
+      float *l_qkvr = acts.qkvr + (long)l * B * T * 3 * C +
+                      idx_off * 3 * C; // 3*C elements per T
+
+      float *l_atty = acts.atty + (long)l * B * T * C + c_off;
+
+      float *l_att = acts.att + (long)l * B * NH * T * T +
+                     nh_off * T; // NH*T elements per T
+
+      float *l_attproj = acts.attproj + (long)l * B * T * C + c_off;
+      float *l_residual2 = acts.residual2 + (long)l * B * T * C + c_off;
+      float *l_ln2 = acts.ln2 + (long)l * B * T * C + c_off;
+      float *l_ln2_mean = acts.ln2_mean + (long)l * B * T + idx_off;
+      float *l_ln2_rstd = acts.ln2_rstd + (long)l * B * T + idx_off;
+
+      float *l_fch = acts.fch + (long)l * B * T * 4 * C + c4_off;
+      float *l_fch_gelu = acts.fch_gelu + (long)l * B * T * 4 * C + c4_off;
+      float *l_fcproj = acts.fcproj + (long)l * B * T * C + c_off;
+      float *l_residual3 =
+          acts.residual3 + (long)l * B * T * C + c_off; // Output of this layer
+
+      // acts.output is a scratch buffer. It's allocated for B*T*max_dim.
+      // We offset it by the microbatch to avoid conflicts if PEs are processing
+      // different microbatches.
+      float *scratch = acts.output + idx_off * max(3 * C, max(NH * T, Vp));
+
+      // Parameter pointers are layer-specific but not microbatch-specific
+      float *l_ln1w = params.ln1w + l * C;
+      float *l_ln1b = params.ln1b + l * C;
+      float *l_qkvw = params.qkvw + l * 3 * C * C;
+      float *l_qkvb = params.qkvb + l * 3 * C;
+      float *l_attprojw = params.attprojw + l * C * C;
+      float *l_attprojb = params.attprojb + l * C;
+      float *l_ln2w = params.ln2w + l * C;
+      float *l_ln2b = params.ln2b + l * C;
+      float *l_fcw = params.fcw + l * 4 * C * C;
+      float *l_fcb = params.fcb + l * 4 * C;
+      float *l_fcprojw = params.fcprojw + l * C * 4 * C;
+      float *l_fcprojb = params.fcprojb + l * C;
+
+      layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b,
+                        mb_size, T, C);
+      matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, mb_size, T, C, 3 * C);
+      attention_forward(l_atty, l_qkvr, l_att, scratch, mb_size, T, C, NH);
+      matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, mb_size, T, C,
+                     C);
+      residual_forward(l_residual2, residual, l_attproj, mb_size * T * C);
+      layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w,
+                        l_ln2b, mb_size, T, C);
+      matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, mb_size, T, C, 4 * C);
+      gelu_forward(l_fch_gelu, l_fch, mb_size * T * 4 * C);
+      matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, mb_size, T,
+                     4 * C, C);
+      residual_forward(l_residual3, l_residual2, l_fcproj, mb_size * T * C);
+    }
+
+    // 2. Send to Next PE (Transmit)
+    if (my_pe < n_pes - 1) {
+      // The output of the last layer of this PE for this microbatch
+      float *last_output =
+          acts.residual3 + (long)(part.num_layers - 1) * B * T * C + c_off;
+
+      cudaCheck(
+          cudaDeviceSynchronize()); // Ensure computation is done before sending
+
+      // Put to Next PE's nvshmem_act_buffer at the correct microbatch offset
+      nvshmem_putmem(model->nvshmem_act_buffer + c_off, last_output,
+                     mb_size * T * C * sizeof(float), my_pe + 1);
+      nvshmem_quiet(); // Ensure data visibility for the remote PE
+
+      // Signal Next PE that this microbatch is ready
+      nvshmem_int_p(1, model->nvshmem_fwd_flags + step, my_pe + 1);
+    }
+
+    // 3. Final PE Processing (Loss Calculation)
+    if (my_pe == n_pes - 1) {
+      // Input to final layernorm for this microbatch
+      residual =
+          acts.residual3 + (long)(part.num_layers - 1) * B * T * C + c_off;
+
+      // Logits scratch buffer for this microbatch
+      float *l_logits = acts.output + idx_off * Vp;
+
+      // Final layernorm activations for this microbatch
+      float *l_lnf = acts.lnf + c_off;
+      float *l_lnf_mean = acts.lnf_mean + idx_off;
+      float *l_lnf_rstd = acts.lnf_rstd + idx_off;
+
+      // Targets and losses for this microbatch
+      int *l_targets = (targets != NULL) ? model->targets + idx_off : NULL;
+      float *l_losses = acts.losses + idx_off;
+
+      layernorm_forward(l_lnf, l_lnf_mean, l_lnf_rstd, residual, params.lnfw,
+                        params.lnfb, mb_size, T, C);
+      matmul_forward(l_logits, l_lnf, params.wte, NULL, mb_size, T, C, Vp);
+
+      if (targets != NULL) {
+        fused_classifier3(l_logits, l_losses, NULL, l_targets, mb_size, T, V,
+                          Vp);
+      }
+    }
   }
+
+  // After all microbatches, synchronize global mean_loss
+  if (my_pe == n_pes - 1 && targets != NULL) {
+    // Copy all microbatch losses from device to host
+    cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float),
+                         cudaMemcpyDeviceToHost));
+    float mean_loss = 0.0f;
+    for (int i = 0; i < B * T; i++) {
+      mean_loss += model->cpu_losses[i];
+    }
+    mean_loss /= (B * T);
+    model->mean_loss = mean_loss;
+  } else {
+    // Non-final PEs or no targets: set placeholder for backward pass check
+    model->mean_loss = targets != NULL ? 0.0f : -1.0f;
+  }
+
+  // Barrier at end of FWD to ensure all stages done before BWD start.
+  // This is a strict GPipe synchronization.
+  nvshmem_barrier_all();
 }
 
 void gpt2_zero_grad(GPT2 *model) {
   if (model->grads_acts_memory != NULL) {
-    cudaCheck(cudaMemset(model->grads_acts_memory, 0, model->num_grad_acts * sizeof(float)));
+    cudaCheck(cudaMemset(model->grads_acts_memory, 0,
+                         model->num_grad_acts * sizeof(float)));
   }
   if (model->grads_memory != NULL) {
-    cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(float)));
+    cudaCheck(cudaMemset(model->grads_memory, 0,
+                         model->num_parameters * sizeof(float)));
   }
 }
 
@@ -1404,15 +1600,18 @@ void gpt2_backward(GPT2 *model) {
   int n_pes = nvshmem_n_pes();
 
   if (model->grads_memory == NULL) {
-    model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
+    model->grads_memory =
+        malloc_and_point_parameters(&model->grads, model->param_sizes, 1);
     printf("[PE %d] allocated %zu MiB for parameter gradients\n", my_pe,
            (model->num_parameters * sizeof(float)) >> 20);
 
     size_t bw_act_sizes[NUM_BACKWARD_TENSORS];
     GPT2Config cfg = model->config;
     cfg.num_layers = 1;
-    fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
-    model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
+    fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len,
+                           cfg);
+    model->grads_acts_memory =
+        malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
     model->num_grad_acts = 0;
     for (int i = 0; i < NUM_BACKWARD_TENSORS; i++) {
       model->num_grad_acts += bw_act_sizes[i];
@@ -1432,105 +1631,158 @@ void gpt2_backward(GPT2 *model) {
   ParameterTensors grads = model->grads;
   ActivationTensors acts = model->acts;
   GradActTensors grads_acts = model->grads_acts;
-  float *residual;
-  float *dresidual = grads_acts.residual3;
 
-  // Pipeline backward pass - process PEs in reverse order
-  for (int target_pe = n_pes - 1; target_pe >= 0; target_pe--) {
-    if (my_pe == target_pe) {
-      // Last PE: backward through classifier + final layernorm
-      if (my_pe == n_pes - 1) {
-        matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf,
-                        params.wte, B, T, C, Vp);
-        residual = acts.residual3 + (part.num_layers - 1) * B * T * C;
-        layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.bt4c,
-                           residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
-      }
+  // GPipe Microbatching
+  int M = model->num_micro_batches;
+  int mb_size = model->micro_batch_size;
 
-      // Non-last PEs: receive gradients from next PE
-      if (my_pe < n_pes - 1) {
-        cudaMemcpy(dresidual, model->nvshmem_grad_buffer, B * T * C * sizeof(float),
-                   cudaMemcpyDeviceToDevice);
-      }
+  host_p2p_reset_flags(model->nvshmem_bwd_flags, M);
 
-      // Backward through this PE's layers
-      for (int l = part.num_layers - 1; l >= 0; l--) {
-        if (l == 0) {
-          if (my_pe == 0) {
-            residual = acts.encoded;
-          } else {
-            residual = model->nvshmem_act_buffer;
-          }
-        } else {
-          residual = acts.residual3 + (l - 1) * B * T * C;
-        }
+  // Note: Gradients are accumulated into the same 'grads' buffers (which are
+  // sized for L layers). This is safe because only one microbatch processes at
+  // a time per PE (serial loop). 'grads_acts' (activations gradients) are
+  // essentially scratch space and can be reused or offset. Current
+  // implementation has 'grads_acts.bt4c' size B*T*... We can use offsets to be
+  // safe or reuse if we are sure of serial execution. With B-sized allocation,
+  // offsets are safer.
 
-        float *l_ln1w = params.ln1w + l * C;
-        float *l_qkvw = params.qkvw + l * 3 * C * C;
-        float *l_attprojw = params.attprojw + l * C * C;
-        float *l_ln2w = params.ln2w + l * C;
-        float *l_fcw = params.fcw + l * 4 * C * C;
-        float *l_fcprojw = params.fcprojw + l * C * 4 * C;
+  for (int step = 0; step < M; step++) {
+    size_t offset_elem = (size_t)step * mb_size * T * C;
+    size_t offset_idx = (size_t)step * mb_size * T;
 
-        float *dl_ln1w = grads.ln1w + l * C;
-        float *dl_ln1b = grads.ln1b + l * C;
-        float *dl_qkvw = grads.qkvw + l * 3 * C * C;
-        float *dl_qkvb = grads.qkvb + l * 3 * C;
-        float *dl_attprojw = grads.attprojw + l * C * C;
-        float *dl_attprojb = grads.attprojb + l * C;
-        float *dl_ln2w = grads.ln2w + l * C;
-        float *dl_ln2b = grads.ln2b + l * C;
-        float *dl_fcw = grads.fcw + l * 4 * C * C;
-        float *dl_fcb = grads.fcb + l * 4 * C;
-        float *dl_fcprojw = grads.fcprojw + l * C * 4 * C;
-        float *dl_fcprojb = grads.fcprojb + l * C;
+    long idx_off = (long)step * mb_size * T;
+    long c_off = idx_off * C;
+    long c4_off = idx_off * 4 * C;
+    long nh_off = idx_off * NH * T;
 
-        float *l_ln1 = acts.ln1 + l * B * T * C;
-        float *l_ln1_mean = acts.ln1_mean + l * B * T;
-        float *l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        float *l_qkvr = acts.qkvr + l * B * T * 3 * C;
-        float *l_atty = acts.atty + l * B * T * C;
-        float *l_att = acts.att + l * B * NH * T * T;
-        float *l_residual2 = acts.residual2 + l * B * T * C;
-        float *l_ln2 = acts.ln2 + l * B * T * C;
-        float *l_ln2_mean = acts.ln2_mean + l * B * T;
-        float *l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        float *l_fch = acts.fch + l * B * T * 4 * C;
-        float *l_fch_gelu = acts.fch_gelu + l * B * T * 4 * C;
-
-        // Only last PE has lnf allocated, others use scratch_btc
-        float *dl_btc = (my_pe == n_pes - 1) ? acts.lnf : acts.scratch_btc;
-        float *dl_bt4c = grads_acts.bt4c;
-        float *dl_preatt = grads_acts.preatt;
-        float *scratch = acts.output;
-        float *buffer_a = l_atty;
-        float *buffer_b = l_fch;
-
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4 * C, C);
-        gelu_backward(dl_bt4c, l_fch, dl_bt4c, B * T * 4 * C);
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C, 4 * C);
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
-        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
-      }
-
-      // Non-first PEs: send gradients to previous PE
-      if (my_pe > 0) {
-        cudaCheck(cudaDeviceSynchronize());
-        nvshmem_putmem(model->nvshmem_grad_buffer, dresidual, B * T * C * sizeof(float), my_pe - 1);
-        nvshmem_quiet();
-      }
-
-      // First PE: backward through embedding
-      if (my_pe == 0) {
-        encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
-      }
+    // 1. Wait for Dependency
+    if (my_pe < n_pes - 1) {
+      // Wait for signal from Next PE (i+1)
+      nvshmem_int_wait_until(model->nvshmem_bwd_flags + step, NVSHMEM_CMP_EQ,
+                             1);
     }
 
-    // Synchronize all PEs before next iteration
-    nvshmem_barrier_all();
+    float *residual;
+    float *dresidual =
+        grads_acts.residual3 + c_off; // Use B-sized buffer offset
+
+    // Last PE: backward through classifier + final layernorm
+    if (my_pe == n_pes - 1) {
+      // Offsets
+      float *l_bt4c = grads_acts.bt4c + c4_off;
+      float *l_output = acts.output + idx_off * Vp; // The logits/probs scratch
+      float *l_lnf = acts.lnf + c_off;
+      float *l_lnf_mean = acts.lnf_mean + idx_off;
+      float *l_lnf_rstd = acts.lnf_rstd + idx_off;
+
+      residual =
+          acts.residual3 + (long)(part.num_layers - 1) * B * T * C + c_off;
+
+      matmul_backward(l_bt4c, grads.wte, NULL, l_output, l_lnf, params.wte,
+                      mb_size, T, C, Vp);
+      layernorm_backward(dresidual, grads.lnfw, grads.lnfb, l_bt4c, residual,
+                         params.lnfw, l_lnf_mean, l_lnf_rstd, mb_size, T, C);
+    } else {
+      // Not Last PE: receive gradients from Buffer
+      // We read from our own buffer (written by Next PE)
+      cudaCheck(cudaMemcpy(dresidual, model->nvshmem_grad_buffer + offset_elem,
+                           mb_size * T * C * sizeof(float),
+                           cudaMemcpyDeviceToDevice));
+    }
+
+    // Backward through layers
+    for (int l = part.num_layers - 1; l >= 0; l--) {
+      // Setup Input 'residual'
+      if (l == 0) {
+        if (my_pe == 0) {
+          residual = acts.encoded + c_off;
+        } else {
+          residual = model->nvshmem_act_buffer + c_off;
+        }
+      } else {
+        residual = acts.residual3 + (long)(l - 1) * B * T * C + c_off;
+      }
+
+      // Params (Accumulate into shared, no offset)
+      float *dl_ln1w = grads.ln1w + l * C;
+      float *dl_ln1b = grads.ln1b + l * C;
+      float *dl_qkvw = grads.qkvw + l * 3 * C * C;
+      float *dl_qkvb = grads.qkvb + l * 3 * C;
+      float *dl_attprojw = grads.attprojw + l * C * C;
+      float *dl_attprojb = grads.attprojb + l * C;
+      float *dl_ln2w = grads.ln2w + l * C;
+      float *dl_ln2b = grads.ln2b + l * C;
+      float *dl_fcw = grads.fcw + l * 4 * C * C;
+      float *dl_fcb = grads.fcb + l * 4 * C;
+      float *dl_fcprojw = grads.fcprojw + l * C * 4 * C;
+      float *dl_fcprojb = grads.fcprojb + l * C;
+
+      // Acts (Offset)
+      float *l_ln1 = acts.ln1 + (long)l * B * T * C + c_off;
+      float *l_ln1_mean = acts.ln1_mean + (long)l * B * T + idx_off;
+      float *l_ln1_rstd = acts.ln1_rstd + (long)l * B * T + idx_off;
+      float *l_qkvr = acts.qkvr + (long)l * B * T * 3 * C + idx_off * 3 * C;
+      float *l_atty = acts.atty + (long)l * B * T * C + c_off;
+      float *l_att = acts.att + (long)l * B * NH * T * T + nh_off * T;
+      float *l_attprojw = params.attprojw + l * C * C;
+      float *l_residual2 = acts.residual2 + (long)l * B * T * C + c_off;
+
+      float *l_ln2 = acts.ln2 + (long)l * B * T * C + c_off;
+      float *l_ln2_mean = acts.ln2_mean + (long)l * B * T + idx_off;
+      float *l_ln2_rstd = acts.ln2_rstd + (long)l * B * T + idx_off;
+
+      float *l_fch = acts.fch + (long)l * B * T * 4 * C + c4_off;
+      float *l_fch_gelu = acts.fch_gelu + (long)l * B * T * 4 * C + c4_off;
+      float *l_fcprojw = params.fcprojw + l * C * 4 * C;
+      float *l_fcw = params.fcw + l * 4 * C * C;
+      float *l_ln2w = params.ln2w + l * C;
+      float *l_ln1w = params.ln1w + l * C;
+      float *l_qkvw = params.qkvw + l * 3 * C * C;
+
+      // Grad Acts (Offset)
+      // Using different scratch space for Fused Classifier Logic vs internal?
+      // grads_acts.bt4c size is B*... so we iterate.
+      float *dl_bt4c = grads_acts.bt4c + c4_off;
+      float *dl_preatt = grads_acts.preatt + nh_off * T;
+      float *scratch = acts.output + idx_off * max(3 * C, max(NH * T, Vp));
+
+      // Only last PE has lnf allocated, others use scratch_btc
+      float *dl_btc =
+          (my_pe == n_pes - 1) ? acts.lnf + c_off : acts.scratch_btc + c_off;
+
+      // Execute Kernels
+      matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu,
+                      l_fcprojw, mb_size, T, 4 * C, C);
+      gelu_backward(dl_bt4c, l_fch, dl_bt4c, mb_size * T * 4 * C);
+      matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, mb_size, T,
+                      C, 4 * C);
+      layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2,
+                         l_ln2w, l_ln2_mean, l_ln2_rstd, mb_size, T, C);
+      matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty,
+                      l_attprojw, mb_size, T, C, C);
+      attention_backward(dl_bt4c, l_fch, dl_preatt, scratch, l_atty, dl_btc,
+                         l_qkvr, l_att, mb_size, T, C, NH);
+      matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, mb_size,
+                      T, C, 3 * C);
+      layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w,
+                         l_ln1_mean, l_ln1_rstd, mb_size, T, C);
+    }
+
+    // 2. Send to Prev PE
+    if (my_pe > 0) {
+      cudaCheck(cudaDeviceSynchronize());
+      nvshmem_putmem(model->nvshmem_grad_buffer + offset_elem, dresidual,
+                     mb_size * T * C * sizeof(float), my_pe - 1);
+      nvshmem_quiet();
+
+      nvshmem_int_p(1, model->nvshmem_bwd_flags + step, my_pe - 1);
+    }
+
+    // 3. First PE: Embedding
+    if (my_pe == 0) {
+      encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs + idx_off,
+                       mb_size, T, C);
+    }
   }
 
   // All-reduce wte gradients using NVSHMEM
@@ -1538,6 +1790,7 @@ void gpt2_backward(GPT2 *model) {
   size_t wte_size = (size_t)Vp * C;
 
   cudaCheck(cudaDeviceSynchronize());
+  nvshmem_barrier_all(); // Wait for all PEs
 
   // Each PE sends its grads.wte to PE 0's buffer at offset my_pe * wte_size
   nvshmem_float_put(model->nvshmem_wte_grad_buffer + my_pe * wte_size,
@@ -1566,10 +1819,14 @@ void gpt2_backward(GPT2 *model) {
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
                  float eps, float weight_decay, int t) {
   if (model->m_memory == NULL) {
-    cudaCheck(cudaMalloc((void **)&model->m_memory, model->num_parameters * sizeof(float)));
-    cudaCheck(cudaMalloc((void **)&model->v_memory, model->num_parameters * sizeof(float)));
-    cudaCheck(cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
-    cudaCheck(cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
+    cudaCheck(cudaMalloc((void **)&model->m_memory,
+                         model->num_parameters * sizeof(float)));
+    cudaCheck(cudaMalloc((void **)&model->v_memory,
+                         model->num_parameters * sizeof(float)));
+    cudaCheck(
+        cudaMemset(model->m_memory, 0, model->num_parameters * sizeof(float)));
+    cudaCheck(
+        cudaMemset(model->v_memory, 0, model->num_parameters * sizeof(float)));
     int my_pe = nvshmem_my_pe();
     printf("[PE %d] allocated %zu MiB for AdamW optimizer state\n", my_pe,
            (2 * model->num_parameters * sizeof(float)) >> 20);
@@ -1601,6 +1858,8 @@ void gpt2_free(GPT2 *model) {
   nvshmem_free(model->nvshmem_grad_buffer);
   nvshmem_free(model->nvshmem_wte_grad_buffer);
   nvshmem_free(model->nvshmem_token_buffer);
+  nvshmem_free(model->nvshmem_fwd_flags);
+  nvshmem_free(model->nvshmem_bwd_flags);
 }
 
 #ifndef TESTING
@@ -1689,6 +1948,7 @@ void error_usage() {
   fprintf(stderr, "  -m <int>    val_max_steps (default = 20)\n");
   fprintf(stderr, "  -s <int>    sample_every (default = 20)\n");
   fprintf(stderr, "  -g <int>    genT (default = 64)\n");
+  fprintf(stderr, "  -n <int>    num_micro_batches (default = 1)\n");
   exit(EXIT_FAILURE);
 }
 
@@ -1710,7 +1970,8 @@ int main(int argc, char *argv[]) {
 
   if (n_pes < 2) {
     if (my_pe == 0) {
-      fprintf(stderr, "Error: This pipeline requires at least 2 GPUs, got %d\n", n_pes);
+      fprintf(stderr, "Error: This pipeline requires at least 2 GPUs, got %d\n",
+              n_pes);
     }
     nvshmem_finalize();
     MPI_Finalize();
@@ -1725,8 +1986,10 @@ int main(int argc, char *argv[]) {
   nvshmem_barrier_all();
 
   // Parse arguments
-  const char *train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-  const char *val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
+  const char *train_data_pattern =
+      "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+  const char *val_data_pattern =
+      "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
   const char *output_log_file = NULL;
   int B = 4;
   int T = 1024;
@@ -1735,48 +1998,73 @@ int main(int argc, char *argv[]) {
   int val_max_steps = 20;
   int sample_every = 20;
   int genT = 64;
+  int num_micro_batches = 1;
 
   for (int i = 1; i < argc; i += 2) {
-    if (i + 1 >= argc) error_usage();
-    if (argv[i][0] != '-') error_usage();
-    if (strlen(argv[i]) != 2) error_usage();
-    if (argv[i][1] == 'i') train_data_pattern = argv[i + 1];
-    else if (argv[i][1] == 'j') val_data_pattern = argv[i + 1];
-    else if (argv[i][1] == 'o') output_log_file = argv[i + 1];
-    else if (argv[i][1] == 'b') B = atoi(argv[i + 1]);
-    else if (argv[i][1] == 't') T = atoi(argv[i + 1]);
-    else if (argv[i][1] == 'l') learning_rate = atof(argv[i + 1]);
-    else if (argv[i][1] == 'v') val_loss_every = atoi(argv[i + 1]);
-    else if (argv[i][1] == 'm') val_max_steps = atoi(argv[i + 1]);
-    else if (argv[i][1] == 's') sample_every = atoi(argv[i + 1]);
-    else if (argv[i][1] == 'g') genT = atoi(argv[i + 1]);
-    else error_usage();
+    if (i + 1 >= argc)
+      error_usage();
+    if (argv[i][0] != '-')
+      error_usage();
+    if (strlen(argv[i]) != 2)
+      error_usage();
+    if (argv[i][1] == 'i')
+      train_data_pattern = argv[i + 1];
+    else if (argv[i][1] == 'j')
+      val_data_pattern = argv[i + 1];
+    else if (argv[i][1] == 'o')
+      output_log_file = argv[i + 1];
+    else if (argv[i][1] == 'b')
+      B = atoi(argv[i + 1]);
+    else if (argv[i][1] == 't')
+      T = atoi(argv[i + 1]);
+    else if (argv[i][1] == 'l')
+      learning_rate = atof(argv[i + 1]);
+    else if (argv[i][1] == 'v')
+      val_loss_every = atoi(argv[i + 1]);
+    else if (argv[i][1] == 'm')
+      val_max_steps = atoi(argv[i + 1]);
+    else if (argv[i][1] == 's')
+      sample_every = atoi(argv[i + 1]);
+    else if (argv[i][1] == 'g')
+      genT = atoi(argv[i + 1]);
+    else if (argv[i][1] == 'n')
+      num_micro_batches = atoi(argv[i + 1]);
+    else
+      error_usage();
   }
 
   if (my_pe == 0) {
-    printf("+------------------------+----------------------------------------------------+\n");
-    printf("| Parameter              | Value                                              |\n");
-    printf("+------------------------+----------------------------------------------------+\n");
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\n");
+    printf("| Parameter              | Value                                   "
+           "           |\n");
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\n");
     printf("| NVSHMEM PEs (GPUs)     | %-50d |\n", n_pes);
     printf("| train data pattern     | %-50s |\n", train_data_pattern);
     printf("| val data pattern       | %-50s |\n", val_data_pattern);
     printf("| batch size B           | %-50d |\n", B);
     printf("| sequence length T      | %-50d |\n", T);
     printf("| learning rate          | %-50f |\n", learning_rate);
-    printf("+------------------------+----------------------------------------------------+\n");
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\n");
   }
 
   // Setup cuBLAS
   cublasCheck(cublasCreate(&cublas_handle));
   int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
-  cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-  cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+  cublas_compute_type =
+      enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+  cublasMath_t cublas_math_mode =
+      enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
   cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
 
   if (my_pe == 0) {
     printf("| device                 | %-50s |\n", deviceProp.name);
-    printf("| TF32                   | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
-    printf("+------------------------+----------------------------------------------------+\n");
+    printf("| TF32                   | %-50s |\n",
+           enable_tf32 ? "enabled" : "disabled");
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\n");
   }
 
   // Read header to get num_layers for partitioning
@@ -1796,20 +2084,22 @@ int main(int argc, char *argv[]) {
 
   if (my_pe == 0) {
     printf("| total_layers           | %-50d |\n", total_layers);
-    printf("+------------------------+----------------------------------------------------+\n");
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\n");
   }
-  
+
   // Print layer distribution for each PE (synchronized)
   for (int pe = 0; pe < n_pes; pe++) {
     if (my_pe == pe) {
-      printf("| PE %d layers            | %d-%d (count: %d)%-*s |\n",
-             my_pe, part.first_layer, part.first_layer + part.num_layers - 1,
+      printf("| PE %d layers            | %d-%d (count: %d)%-*s |\n", my_pe,
+             part.first_layer, part.first_layer + part.num_layers - 1,
              part.num_layers, 50 - 25, "");
     }
     nvshmem_barrier_all();
   }
   if (my_pe == 0) {
-    printf("+------------------------+----------------------------------------------------+\n");
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\n");
   }
 
   // Build model with partitioning
@@ -1819,11 +2109,13 @@ int main(int argc, char *argv[]) {
   if (my_pe == 0) {
     printf("| max_sequence_length T  | %-50d |\n", model.config.max_seq_len);
     printf("| vocab_size V           | %-50d |\n", model.config.vocab_size);
-    printf("| padded_vocab_size Vp   | %-50d |\n", model.config.padded_vocab_size);
+    printf("| padded_vocab_size Vp   | %-50d |\n",
+           model.config.padded_vocab_size);
     printf("| num_layers L (total)   | %-50d |\n", model.config.num_layers);
     printf("| num_heads NH           | %-50d |\n", model.config.num_heads);
     printf("| channels C             | %-50d |\n", model.config.channels);
-    printf("+------------------------+----------------------------------------------------+\n");
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\n");
   }
 
   // Build data loaders
@@ -1832,22 +2124,26 @@ int main(int argc, char *argv[]) {
   dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
   int train_num_batches = train_loader.num_tokens / (B * T);
   int val_num_batches = val_loader.num_tokens / (B * T);
-  if (val_num_batches > val_max_steps) val_num_batches = val_max_steps;
+  if (val_num_batches > val_max_steps)
+    val_num_batches = val_max_steps;
 
   if (my_pe == 0) {
     printf("| train_num_batches      | %-50d |\n", train_num_batches);
     printf("| val_num_batches        | %-50d |\n", val_num_batches);
-    printf("+------------------------+----------------------------------------------------+\n");
+    printf("+------------------------+-----------------------------------------"
+           "-----------+\n");
   }
 
   // Allocate NVSHMEM buffers
   model.batch_size = B;
   model.seq_len = T;
+  model.num_micro_batches = num_micro_batches; // Set from args
   gpt2_allocate_nvshmem_buffers(&model);
 
   // Dummy forward to allocate activations
   int *dummy_batch = (int *)malloc(B * T * sizeof(int));
-  for (int i = 0; i < B * T; i++) dummy_batch[i] = 0;
+  for (int i = 0; i < B * T; i++)
+    dummy_batch[i] = 0;
   gpt2_forward(&model, dummy_batch, NULL, B, T);
   free(dummy_batch);
 
@@ -1860,7 +2156,8 @@ int main(int argc, char *argv[]) {
 
   unsigned long long rng_state = 1337;
   int *gen_tokens = (int *)mallocCheck(B * T * sizeof(int));
-  float *cpu_logits = (float *)mallocCheck(model.config.vocab_size * sizeof(float));
+  float *cpu_logits =
+      (float *)mallocCheck(model.config.vocab_size * sizeof(float));
 
   // Training loop
   struct timespec start, end;
@@ -1887,16 +2184,21 @@ int main(int argc, char *argv[]) {
 
     // Sampling (only on last PE which has the output)
     if ((step > 0 && step % sample_every == 0) || last_step) {
-      for (int i = 0; i < B * T; ++i) gen_tokens[i] = GPT2_EOT;
-      if (my_pe == n_pes - 1) printf("generating:\n---\n");
+      for (int i = 0; i < B * T; ++i)
+        gen_tokens[i] = GPT2_EOT;
+      if (my_pe == n_pes - 1)
+        printf("generating:\n---\n");
       for (int t = 1; t < genT; t++) {
         gpt2_forward(&model, gen_tokens, NULL, B, T);
         if (my_pe == n_pes - 1) {
-          float *logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
-          cudaCheck(cudaMemcpy(cpu_logits, logits, model.config.vocab_size * sizeof(float),
+          float *logits =
+              model.acts.output + (t - 1) * model.config.padded_vocab_size;
+          cudaCheck(cudaMemcpy(cpu_logits, logits,
+                               model.config.vocab_size * sizeof(float),
                                cudaMemcpyDeviceToHost));
           float coin = random_f32(&rng_state);
-          int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
+          int next_token =
+              sample_softmax(cpu_logits, model.config.vocab_size, coin);
           gen_tokens[t] = next_token;
           if (tokenizer.init_ok) {
             const char *token_str = tokenizer_decode(&tokenizer, next_token);
@@ -1906,24 +2208,30 @@ int main(int argc, char *argv[]) {
           }
           fflush(stdout);
         }
-        // Send next token from last PE to PE 0 only using NVSHMEM point-to-point
-        // Only PE 0 needs the token for the next embedding lookup
+        // Send next token from last PE to PE 0 only using NVSHMEM
+        // point-to-point Only PE 0 needs the token for the next embedding
+        // lookup
         if (my_pe == n_pes - 1) {
-          cudaCheck(cudaMemcpy(model.nvshmem_token_buffer, &gen_tokens[t], sizeof(int), cudaMemcpyHostToDevice));
-          nvshmem_int_put(model.nvshmem_token_buffer, model.nvshmem_token_buffer, 1, 0);
+          cudaCheck(cudaMemcpy(model.nvshmem_token_buffer, &gen_tokens[t],
+                               sizeof(int), cudaMemcpyHostToDevice));
+          nvshmem_int_put(model.nvshmem_token_buffer,
+                          model.nvshmem_token_buffer, 1, 0);
           nvshmem_quiet();
         }
         nvshmem_barrier_all();
         // Only PE 0 copies the token from GPU to CPU
         if (my_pe == 0) {
-          cudaCheck(cudaMemcpy(&gen_tokens[t], model.nvshmem_token_buffer, sizeof(int), cudaMemcpyDeviceToHost));
+          cudaCheck(cudaMemcpy(&gen_tokens[t], model.nvshmem_token_buffer,
+                               sizeof(int), cudaMemcpyDeviceToHost));
         }
         nvshmem_barrier_all();
       }
-      if (my_pe == n_pes - 1) printf("\n---\n");
+      if (my_pe == n_pes - 1)
+        printf("\n---\n");
     }
 
-    if (last_step) break;
+    if (last_step)
+      break;
 
     // Training step
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1935,13 +2243,15 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaDeviceSynchronize());
     clock_gettime(CLOCK_MONOTONIC, &end);
 
-    double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double time_elapsed_s =
+        (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     total_sum_iteration_time_s += time_elapsed_s;
     int tokens_per_second = (B * T) / time_elapsed_s;
 
     if (my_pe == n_pes - 1) {
       printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1,
-             train_num_batches, model.mean_loss, time_elapsed_s * 1000, tokens_per_second);
+             train_num_batches, model.mean_loss, time_elapsed_s * 1000,
+             tokens_per_second);
     }
     logger_log_train(&logger, step, model.mean_loss);
   }
