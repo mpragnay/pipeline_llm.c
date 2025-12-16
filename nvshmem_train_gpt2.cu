@@ -1084,6 +1084,16 @@ typedef struct {
 // ----------------------------------------------------------------------------
 // P2P Signaling Helpers
 
+void host_wait_flag(int *flag_addr, int val) {
+  int current_val;
+  do {
+    cudaCheck(cudaMemcpy(&current_val, flag_addr, sizeof(int),
+                         cudaMemcpyDeviceToHost));
+    // Optional: basic exponential backoff or yield to avoid PCI-E saturation
+    // but for now simple poll is fine.
+  } while (current_val != val);
+}
+
 __device__ void p2p_wait_flag(int *flags, int idx, int val) {
   nvshmem_int_wait_until(flags + idx, NVSHMEM_CMP_EQ, val);
 }
@@ -1408,11 +1418,8 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
     // 1. Wait for Dependency (Receive)
     if (my_pe > 0) {
       // Wait for signal from PE i-1 for this microbatch
-      // Host-side spin loop (since nvshmem_int_wait_until is device-only in
-      // some versions)
-      volatile int *flag_addr = model->nvshmem_fwd_flags + step;
-      while (*flag_addr != 1)
-        ;
+      // Host-side polling using cudaMemcpy (safe for device memory)
+      host_wait_flag(model->nvshmem_fwd_flags + step, 1);
       // nvshmem_fence() not strictly required for RAW dependency if using
       // wait_until, but safe.
     }
@@ -1657,9 +1664,7 @@ void gpt2_backward(GPT2 *model) {
     // 1. Wait for Dependency
     if (my_pe < n_pes - 1) {
       // Wait for signal from Next PE (i+1)
-      volatile int *flag_addr = model->nvshmem_bwd_flags + step;
-      while (*flag_addr != 1)
-        ;
+      host_wait_flag(model->nvshmem_bwd_flags + step, 1);
     }
 
     float *residual;
