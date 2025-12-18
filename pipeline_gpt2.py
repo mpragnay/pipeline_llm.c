@@ -549,6 +549,7 @@ def main():
     parser.add_argument('-s', type=int, default=20)
     parser.add_argument('-g', type=int, default=64)
     parser.add_argument('-c', '--num_microbatches', type=int, default=1, help='Number of micro-batches for pipeline parallelism')
+    parser.add_argument('-e', '--epochs', type=int, default=1, help='Number of epochs to train')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging for micro-batching')
     args = parser.parse_args()
     
@@ -579,6 +580,7 @@ def main():
     print(f"| sample_every          | {args.s:<50} |")
     print(f"| genT                  | {args.g:<50} |")
     print(f"| num_microbatches      | {args.num_microbatches:<50} |")
+    print(f"| epochs                | {args.epochs:<50} |")
     print(f"| verbose logging       | {str(args.verbose):<50} |")
     print("+-----------------------+----------------------------------------------------+")
 
@@ -598,10 +600,12 @@ def main():
     train_loader = DataLoader(args.i, args.b, args.t, shuffle=True)
     val_loader = DataLoader(args.j, args.b, args.t, shuffle=False)
     
-    train_num_batches = len(train_loader.tokens) // (args.b * args.t) # Approx
+    batches_per_epoch = len(train_loader.tokens) // (args.b * args.t)
+    train_num_batches = batches_per_epoch * args.epochs  # Total batches across all epochs
     val_num_batches = len(val_loader.tokens) // (args.b * args.t)
     if val_num_batches > args.m: val_num_batches = args.m
     
+    print(f"| batches per epoch     | {batches_per_epoch:<50} |")
     print(f"| train_num_batches     | {train_num_batches:<50} |")
     print(f"| val_num_batches       | {val_num_batches:<50} |")
     print("+-----------------------+----------------------------------------------------+")
