@@ -65,6 +65,11 @@ void ncclCheck(ncclResult_t status, const char *file, int line) {
 }
 #define ncclCheck(err) (ncclCheck(err, __FILE__, __LINE__))
 
+static int VERBOSE = 0;
+#define LOG_MB(stage_id, mb_idx, fmt, ...)                                     \
+  if (VERBOSE)                                                                 \
+  printf("[Stage %d] [MB %d] " fmt "\n", stage_id, mb_idx, ##__VA_ARGS__)
+
 static cublasComputeType_t cublas_compute_type;
 cublasHandle_t cublas_handle;
 
@@ -1259,6 +1264,7 @@ void stage_build_from_checkpoint(PipelineStage *stage,
 
 // Forward pass for a single microbatch on this stage
 void stage_forward(PipelineStage *stage, int mb_idx) {
+  LOG_MB(stage->pipe_config.stage_id, mb_idx, "Starting forward pass");
   int B = stage->pipe_config.microbatch_size;
   int T = stage->pipe_config.seq_len;
   int C = stage->config.channels;
@@ -1382,10 +1388,12 @@ void stage_forward(PipelineStage *stage, int mb_idx) {
     cudaCheck(cudaMemcpy(stage->send_buffer, residual,
                          B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
   }
+  LOG_MB(stage->pipe_config.stage_id, mb_idx, "Finished forward pass");
 }
 
 // Backward pass for a single microbatch on this stage
 void stage_backward(PipelineStage *stage, int mb_idx) {
+  LOG_MB(stage->pipe_config.stage_id, mb_idx, "Starting backward pass");
   int B = stage->pipe_config.microbatch_size;
   int T = stage->pipe_config.seq_len;
   int C = stage->config.channels;
@@ -1508,6 +1516,7 @@ void stage_backward(PipelineStage *stage, int mb_idx) {
     cudaCheck(cudaMemcpy(stage->send_buffer, dresidual,
                          B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
   }
+  LOG_MB(stage->pipe_config.stage_id, mb_idx, "Finished backward pass");
 }
 
 // Update parameters using accumulated gradients
@@ -1674,16 +1683,22 @@ void stage_update(PipelineStage *stage, float learning_rate, float beta1,
                      false);
 }
 
-// Zero out gradients
-void stage_zero_grad(PipelineStage *stage) {
-  // Only zero per-iteration gradients, NOT accumulated gradients!
-  // Accumulated gradients are zeroed after optimizer update
+// Zero out model gradients (call once per global step)
+void stage_zero_model_grad(PipelineStage *stage) {
   cudaCheck(cudaMemset(stage->grads_memory, 0,
                        stage->num_parameters * sizeof(float)));
-  // CRITICAL: Zero out activation gradients too, as kernels accumulate into
-  // them!
+}
+
+// Zero out activation gradients (call once per microbatch)
+void stage_zero_activation_grad(PipelineStage *stage) {
   cudaCheck(cudaMemset(stage->grads_acts_memory, 0,
                        stage->num_grad_acts * sizeof(float)));
+}
+
+// Deprecated wrapper for backward compatibility during refactor
+void stage_zero_grad(PipelineStage *stage) {
+  stage_zero_model_grad(stage);
+  stage_zero_activation_grad(stage);
 }
 
 // Gradient clipping kernel
@@ -1848,6 +1863,7 @@ int main(int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--verbose") == 0) {
       verbose = 1;
+      VERBOSE = 1;
       continue; // No value needed, just a flag
     }
 
@@ -2164,22 +2180,26 @@ int main(int argc, char *argv[]) {
 
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // 2. Forward Pass
-    int mb_idx = 0;
-
-    if (stage.pipe_config.is_first_stage) {
-      stage_forward(&stage, mb_idx);
-      if (!stage.pipe_config.is_last_stage) {
-        ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
-                           rank + 1, stage.nccl_comm, cudaStreamDefault));
-      }
-    } else {
-      ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size, ncclFloat,
-                         rank - 1, stage.nccl_comm, cudaStreamDefault));
-      stage_forward(&stage, mb_idx);
-      if (!stage.pipe_config.is_last_stage) {
-        ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
-                           rank + 1, stage.nccl_comm, cudaStreamDefault));
+    // 2. Forward Pass (GPipe Schedule)
+    // Simple Schedule: All-Forward, then All-Backward.
+    // This minimizes bubbles significantly compared to stop-and-go.
+    for (int mb_idx = 0; mb_idx < num_microbatches; mb_idx++) {
+      if (stage.pipe_config.is_first_stage) {
+        stage_forward(&stage, mb_idx);
+        if (!stage.pipe_config.is_last_stage) {
+          ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                             ncclFloat, rank + 1, stage.nccl_comm,
+                             cudaStreamDefault));
+        }
+      } else {
+        ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size, ncclFloat,
+                           rank - 1, stage.nccl_comm, cudaStreamDefault));
+        stage_forward(&stage, mb_idx);
+        if (!stage.pipe_config.is_last_stage) {
+          ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                             ncclFloat, rank + 1, stage.nccl_comm,
+                             cudaStreamDefault));
+        }
       }
     }
 
@@ -2187,36 +2207,52 @@ int main(int argc, char *argv[]) {
 
     // 3. Compute loss (last stage only)
     if (stage.pipe_config.is_last_stage) {
-      cudaCheck(cudaMemcpy(
-          stage.cpu_losses, stage.acts_microbatch[mb_idx].losses,
-          microbatch_size * seq_len * sizeof(float), cudaMemcpyDeviceToHost));
-
-      float mean_loss = 0.0f;
-      for (int i = 0; i < microbatch_size * seq_len; i++) {
-        mean_loss += stage.cpu_losses[i];
+      float total_loss = 0.0f;
+      for (int mb = 0; mb < num_microbatches; mb++) {
+        // Copy losses for this microbatch to CPU
+        cudaCheck(cudaMemcpy(stage.cpu_losses, stage.acts_microbatch[mb].losses,
+                             microbatch_size * seq_len * sizeof(float),
+                             cudaMemcpyDeviceToHost));
+        for (int i = 0; i < microbatch_size * seq_len; i++) {
+          total_loss += stage.cpu_losses[i];
+        }
       }
-      mean_loss /= (microbatch_size * seq_len);
-      stage.mean_loss = mean_loss;
+      stage.mean_loss =
+          total_loss / (num_microbatches * microbatch_size * seq_len);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
 
-    // 4. Zero gradients BEFORE backward (FIX: like train_gpt2_fp32.cu)
-    stage_zero_grad(&stage);
+    // 4. Zero Model Gradients (Accumulation Base)
+    // We zero model parameters once per global step.
+    stage_zero_model_grad(&stage);
 
-    // 5. Backward Pass
-    if (stage.pipe_config.is_last_stage) {
-      stage_backward(&stage, mb_idx);
-      if (!stage.pipe_config.is_first_stage) {
-        ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size, ncclFloat,
-                           rank - 1, stage.nccl_comm, cudaStreamDefault));
+    // 5. Backward Pass (GPipe Schedule)
+    for (int mb_idx = 0; mb_idx < num_microbatches; mb_idx++) {
+      // CLEAR activation gradients for each microbatch!
+      // These are temporary scratchpads for backprop.
+      stage_zero_activation_grad(&stage);
+
+      if (stage.pipe_config.is_last_stage) {
+        stage_backward(&stage, mb_idx);
+        if (!stage.pipe_config.is_first_stage) {
+          ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                             ncclFloat, rank - 1, stage.nccl_comm,
+                             cudaStreamDefault));
+        }
+      } else {
+        if (!stage.pipe_config.is_last_stage) {
+          ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size,
+                             ncclFloat, rank + 1, stage.nccl_comm,
+                             cudaStreamDefault));
+        }
+        stage_backward(&stage, mb_idx);
+        if (!stage.pipe_config.is_first_stage) {
+          ncclCheck(ncclSend(stage.send_buffer, stage.comm_buffer_size,
+                             ncclFloat, rank - 1, stage.nccl_comm,
+                             cudaStreamDefault));
+        }
       }
-    } else {
-      if (!stage.pipe_config.is_last_stage) {
-        ncclCheck(ncclRecv(stage.recv_buffer, stage.comm_buffer_size, ncclFloat,
-                           rank + 1, stage.nccl_comm, cudaStreamDefault));
-      }
-      stage_backward(&stage, mb_idx);
     }
 
     cudaCheck(cudaDeviceSynchronize());
