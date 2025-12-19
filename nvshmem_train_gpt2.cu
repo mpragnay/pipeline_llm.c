@@ -1768,7 +1768,8 @@ int main(int argc, char *argv[]) {
 
   // Setup cuBLAS
   cublasCheck(cublasCreate(&cublas_handle));
-  int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+  // int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+  int enable_tf32 = 0;
   cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
   cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
   cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));

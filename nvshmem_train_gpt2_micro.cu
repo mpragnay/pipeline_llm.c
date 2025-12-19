@@ -1265,6 +1265,31 @@ void printer(int B, int T, int C, int micro_batch_no, float* arr, const char* in
   cudaFreeHost(host_buf);
 }
 
+void printer_int(int B, int T, int C, int micro_batch_no, int* arr, const char* initial) {
+  size_t n = (size_t)B * T * C;
+  // allocate pinned host memory for faster transfer
+  int *host_buf = NULL;
+  cudaCheck(cudaMallocHost((void **)&host_buf, n * sizeof(int)));
+  cudaCheck(cudaMemcpy(host_buf, arr, n * sizeof(int), cudaMemcpyDeviceToHost));
+  // Print a limited prefix to avoid huge output
+  size_t max_print = n < 10 ? n : 10;
+  static size_t host_buf_capacity = 0;
+  if (host_buf_capacity < max_print) {
+    if (host_buf != NULL) cudaFreeHost(host_buf);
+    cudaCheck(cudaMallocHost((void **)&host_buf, max_print * sizeof(int)));
+    host_buf_capacity = max_print;
+  }
+  cudaCheck(cudaMemcpy(host_buf, arr, max_print * sizeof(int), cudaMemcpyDeviceToHost));
+  int my_pe = nvshmem_my_pe();
+  for (size_t i = 0; i < max_print; ++i) {
+    printf("counter=%d [PE %d] micro_batch=%d %s[%zu] = %d\n", counter, my_pe, micro_batch_no, initial, i, host_buf[i]);
+  }
+  if (n > max_print) {
+    printf("[PE %d] micro_batch=%d ... (truncated, total %zu elements)\n", my_pe, micro_batch_no, n);
+  }
+  cudaFreeHost(host_buf);
+}
+
 void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log = false) {
   if (model->params_memory == NULL) {
     printf("Error: model was not initialized properly.\n");
@@ -1309,7 +1334,9 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
     }
   }
 
-  printf("[PE %d] copying inputs and targets to device\n", my_pe);
+  if (log) {
+    printf("[PE %d] copying inputs and targets to device\n", my_pe);
+  }
   cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
   if (targets != NULL) {
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
@@ -1327,11 +1354,16 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
     encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C);
   }
 
-  printf("[PE %d] Resetting forward flags\n", my_pe);
+  if (log) {
+    printf("[PE %d] Resetting forward flags\n", my_pe);
+  }
   // Reset fwd_flags to zero before starting
   cudaCheck(cudaMemset(model->fwd_flags, 0, (size_t)micro_batches_per_batch * sizeof(int)));
   cudaCheck(cudaDeviceSynchronize());
-  printf("[PE %d] Forward flags reset\n", my_pe);
+  if (log) {
+    printf("[PE %d] Forward flags reset\n", my_pe);
+    printf("[PE %d] Starting forward pass for %d micro batches\n", my_pe, micro_batches_per_batch);
+  }
 
   // Process micro-batches
   for (int mb = 0; mb < micro_batches_per_batch; mb++) {
@@ -1345,14 +1377,13 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
 
     // Pipeline forward pass - process PEs sequentially
     for (int target_pe = 0; target_pe < n_pes; target_pe++) {
+      if (log){
+        printf("[PE %d] Forward pass on PE %d for micro-batch %d/%d\n", my_pe, target_pe, mb, micro_batches_per_batch);
+      }
       if (my_pe == target_pe) {
         // Non-first PEs: receive activations from previous PE
         if (my_pe > 0) {
-          cudaCheck(cudaDeviceSynchronize());
-          printf("[PE %d] Waiting for forward flag with current value\n", my_pe);
-          printf("%d\n", model->fwd_flags[mb]);
           nvshmemx_int32_wait_until_on_stream(model->fwd_flags + mb, NVSHMEM_CMP_EQ, 1, 0);
-          printf("FORWARD: fwd_flag %d received on PE[%d]", model->fwd_flags[mb], my_pe);
         }
 
         // Process this PE's layers for this micro-batch
@@ -1407,10 +1438,6 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
           gelu_forward(l_fch_gelu, l_fch, local_B * T * 4 * C);
           matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, local_B, T, 4 * C, C);
           residual_forward(l_residual3, l_residual2, l_fcproj, local_B * T * C);
-
-          if (log && l == part.num_layers - 1) {
-            printer(local_B, T, C, mb, l_residual3, "FORWARD: l_residual3");
-          }
         }
 
         // Non-last PEs: send activations to next PE
@@ -1418,18 +1445,16 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
           float *last_output = acts.residual3 + (size_t)(part.num_layers - 1) * B * T * C + (size_t)batch_offset * T * C;
           float *nvshmem_dest = model->nvshmem_act_buffer + (size_t)batch_offset * T * C;
           cudaCheck(cudaDeviceSynchronize());
-          if (log) {
-            printer(micro_batch_size, T, C, mb, last_output, "FORWARD: last_output ");
-          }
           nvshmem_putmem(nvshmem_dest, last_output, local_B * T * C * sizeof(float), my_pe + 1);
           nvshmem_quiet();
-          // last_output sent, now notify
-          // model->fwd_flags[mb] = 1;
           nvshmem_int_p(model->fwd_flags + mb, 1, my_pe + 1);
         }
 
         // Last PE: final layernorm + classifier + loss for this micro-batch
         if (my_pe == n_pes - 1 && part.has_final_ln) {
+          if (log) {
+            printf("[PE %d] Final layernorm and classifier for micro-batch %d/%d\n", my_pe, mb, micro_batches_per_batch);
+          }
           residual = acts.residual3 + (size_t)(part.num_layers - 1) * B * T * C + (size_t)batch_offset * T * C;
           float *lnf = acts.lnf + (size_t)batch_offset * T * C;
           float *lnf_mean = acts.lnf_mean + (size_t)batch_offset * T;
@@ -1439,24 +1464,33 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
           layernorm_forward(lnf, lnf_mean, lnf_rstd, residual, params.lnfw, params.lnfb, local_B, T, C);
           matmul_forward(outptr, lnf, params.wte, NULL, local_B, T, C, Vp);
 
-          if (targets != NULL) {
-            int *tgt_ptr = model->targets + (size_t)batch_offset * T;
-            float *losses_ptr = acts.losses + (size_t)batch_offset * T;
-            fused_classifier3(outptr, losses_ptr, NULL, tgt_ptr, local_B, T, V, Vp);
-            cudaCheck(cudaMemcpy(model->cpu_losses + batch_offset * T, losses_ptr,
-                                 local_B * T * sizeof(float), cudaMemcpyDeviceToHost));
+          if (log) {
+            printf("[PE %d] Final layernorm and classifier for micro-batch %d/%d done\n", my_pe, mb, micro_batches_per_batch);
+          }
+
+          if (log) {
+            printf("[PE %d] losses with targets for micro-batch %d/%d is done\n", my_pe, mb, micro_batches_per_batch);
           }
         }
       }
-
-      // // Synchronize all PEs before next PE processes
-      // nvshmem_barrier_all();
     }
+  }
+  cudaCheck(cudaDeviceSynchronize());
+  if (log) {
+    printf("[PE %d] Completed forward pass for all micro-batches\n", my_pe);
   }
 
   // After all micro-batches, compute mean loss on last PE
   if (my_pe == n_pes - 1 && part.has_final_ln) {
     if (targets != NULL) {
+      if (log) {
+        printf("[PE %d] Computing mean loss after forward pass\n", my_pe);
+      }
+      // Compute Loss for all micro-batches at once
+      fused_classifier3(acts.output, acts.losses, NULL, model->targets, B, T, V, Vp);
+      cudaCheck(cudaDeviceSynchronize());
+      cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses,
+                                 B * T * sizeof(float), cudaMemcpyDeviceToHost));
       float mean_loss = 0.0f;
       for (int i = 0; i < B * T; i++) {
         mean_loss += model->cpu_losses[i];
@@ -1472,6 +1506,9 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T, bool log
   } else {
     // Non-final PEs: set placeholder for backward pass check
     model->mean_loss = (targets != NULL) ? 0.0f : -1.0f;
+  }
+  if (log) {
+    printf("[PE %d] Reached barrier after forward pass\n", my_pe);
   }
 
   nvshmem_barrier_all();
@@ -1533,6 +1570,10 @@ void gpt2_backward(GPT2 *model, bool log = false) {
   int micro_batch_size = model->micro_batch_size;
   int micro_batches_per_batch = model->micro_batches_per_batch;
 
+  // Reset bwd_flags to zero before starting
+  cudaCheck(cudaMemset(model->bwd_flags, 0, (size_t)micro_batches_per_batch * sizeof(int)));
+  cudaCheck(cudaDeviceSynchronize());
+
   // Process micro-batches
   for (int mb = 0; mb < micro_batches_per_batch; mb++) {
     int batch_offset = mb * micro_batch_size;
@@ -1557,6 +1598,12 @@ void gpt2_backward(GPT2 *model, bool log = false) {
           layernorm_backward(dresidual + (size_t)batch_offset * T * C, grads.lnfw, grads.lnfb, dl_bt4c,
                              residual, params.lnfw, acts.lnf_mean + (size_t)batch_offset * T,
                              acts.lnf_rstd + (size_t)batch_offset * T, local_B, T, C);
+          cudaCheck(cudaDeviceSynchronize());
+        }
+        
+        // Busy wait for gradients
+        if (my_pe < n_pes - 1) {
+          nvshmemx_int32_wait_until_on_stream(model->bwd_flags + mb, NVSHMEM_CMP_EQ, 1, 0);
         }
 
         // Non-last PEs: receive gradients from next PE
@@ -1644,6 +1691,8 @@ void gpt2_backward(GPT2 *model, bool log = false) {
           cudaCheck(cudaDeviceSynchronize());
           nvshmem_putmem(nvshmem_dest, dresidual_mb, local_B * T * C * sizeof(float), my_pe - 1);
           nvshmem_quiet();
+          // dresidual_mb sent, now notify
+          nvshmem_int_p(model->bwd_flags + mb, 1, my_pe - 1);
         }
 
         // First PE: backward through embedding
@@ -1654,7 +1703,7 @@ void gpt2_backward(GPT2 *model, bool log = false) {
       }
 
       // Synchronize all PEs before next iteration
-      nvshmem_barrier_all();
+      // nvshmem_barrier_all();
     }
   }
 
@@ -1898,7 +1947,8 @@ int main(int argc, char *argv[]) {
 
   // Setup cuBLAS
   cublasCheck(cublasCreate(&cublas_handle));
-  int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+  // int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
+  int enable_tf32 = 0;
   cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
   cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
   cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
@@ -2001,7 +2051,7 @@ int main(int argc, char *argv[]) {
   // Dummy forward to allocate activations
   int *dummy_batch = (int *)malloc(B * T * sizeof(int));
   for (int i = 0; i < B * T; i++) dummy_batch[i] = 0;
-  gpt2_forward(&model, dummy_batch, NULL, B, T, true);
+  gpt2_forward(&model, dummy_batch, NULL, B, T);
   free(dummy_batch);
 
   printf("dummy forward done\n");
@@ -2083,8 +2133,7 @@ int main(int argc, char *argv[]) {
     // Training step
     clock_gettime(CLOCK_MONOTONIC, &start);
     dataloader_next_batch(&train_loader);
-    printf("Training step %d\n", step);
-    gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, true);
+    gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
     gpt2_zero_grad(&model);
     gpt2_backward(&model);
     gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step + 1);
