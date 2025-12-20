@@ -379,39 +379,53 @@ class NCCLPipelineGPT2(nn.Module):
         Inference-only forward pass without autograd.
         Uses raw dist.send/recv instead of autograd functions.
         """
+        print(f"[Rank {self.rank}] forward_inference: START", flush=True)
         B, T = inputs.size()
         self.allocate_buffers(B, T)
         C = self.config.n_embd
         
         # Rank 0 processes first
         if self.rank == 0:
+            print(f"[Rank {self.rank}] forward_inference: Rank 0 processing", flush=True)
             inputs_device = inputs.to(self.device)
             pos = torch.arange(0, T, dtype=torch.long, device=self.device)
             x = self.wte(inputs_device) + self.wpe(pos)
             
+            print(f"[Rank {self.rank}] forward_inference: Processing {len(self.blocks)} blocks", flush=True)
             for block in self.blocks:
                 x = block(x)
+            print(f"[Rank {self.rank}] forward_inference: Blocks done", flush=True)
             
             # Send to rank 1 (no autograd tracking)
+            print(f"[Rank {self.rank}] forward_inference: Sending to rank 1", flush=True)
             dist.send(x.contiguous(), dst=1)
+            print(f"[Rank {self.rank}] forward_inference: Sent to rank 1", flush=True)
         
         # Rank 1 receives and processes
         elif self.rank == 1:
+            print(f"[Rank {self.rank}] forward_inference: Rank 1 receiving", flush=True)
             dist.recv(self.activation_buffer, src=0)
+            print(f"[Rank {self.rank}] forward_inference: Received from rank 0", flush=True)
             x = self.activation_buffer.clone()
             
+            print(f"[Rank {self.rank}] forward_inference: Processing {len(self.blocks)} blocks", flush=True)
             for block in self.blocks:
                 x = block(x)
+            print(f"[Rank {self.rank}] forward_inference: Blocks done", flush=True)
             
             # Last rank: compute logits
+            print(f"[Rank {self.rank}] forward_inference: Computing logits", flush=True)
             x = self.ln_f(x)
             logits = self.lm_head(x)
+            print(f"[Rank {self.rank}] forward_inference: Logits computed", flush=True)
             
             # Store for return
             self.final_logits = logits
         
         # Barrier at end
+        print(f"[Rank {self.rank}] forward_inference: Waiting at barrier", flush=True)
         dist.barrier()
+        print(f"[Rank {self.rank}] forward_inference: END", flush=True)
         
         # Return logits only from last rank
         if self.rank == self.world_size - 1:
