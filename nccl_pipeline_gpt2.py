@@ -674,6 +674,10 @@ def main():
                     logits = model.forward_inference(ctx)
                     print(f"[Rank {rank}] Step {t}: Forward complete", flush=True)
                     
+                    # CRITICAL: Synchronize CUDA before any CPU operations to avoid deadlock
+                    torch.cuda.synchronize()
+                    print(f"[Rank {rank}] Step {t}: CUDA synchronized", flush=True)
+                    
                     # Only rank 1 (last) has logits and samples
                     if rank == world_size - 1:
                         # Get logits for last position
