@@ -185,9 +185,10 @@ class NCCLPipelineGPT2(nn.Module):
             self.load_from_binary(checkpoint_path)
     
     def allocate_buffers(self, B, T):
-        """Allocate communication buffers"""
+        """Allocate communication buffers, reallocating if size changes"""
         C = self.config.n_embd
-        if self.activation_buffer is None:
+        # Reallocate if buffer doesn't exist or size changed
+        if self.activation_buffer is None or self.activation_buffer.shape != (B, T, C):
             self.activation_buffer = torch.zeros(B, T, C, device=self.device)
             self.gradient_buffer = torch.zeros(B, T, C, device=self.device)
 
