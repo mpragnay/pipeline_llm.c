@@ -594,43 +594,47 @@ def main():
                 print(f"val loss {val_loss:.6f}")
             model.train()
         
-        # Sampling (both ranks participate, rank 0 prints)
+        # Sampling (both ranks participate)
         if (step > 0 and step % args.s == 0) or last_step:
             model.eval()
             if rank == 0:
                 print("generating:\n---")
             
             with torch.no_grad():
-                # Initialize context (rank 0 creates, broadcast to all)
+                # Both ranks start with same context
                 ctx = torch.tensor([[50256]], dtype=torch.long, device=f'cuda:{rank}')
                 
                 for t_gen in range(1, args.g):
                     # Both ranks process the same context
                     logits, _ = model.forward_sequential(ctx, targets=None, verbose=False)
                     
-                    # Rank 1 has the logits, samples token, sends to rank 0
+                    # Rank 1: samples token and sends to Rank 0
                     if rank == 1:
                         next_logits = logits[0, -1, :]
                         probs = F.softmax(next_logits, dim=-1)
                         idx_tensor = torch.multinomial(probs, 1)
                         dist.send(idx_tensor.contiguous(), dst=0)
+                        
+                        # Rank 1: receives the same token back from Rank 0 to stay in sync
+                        idx_tensor_recv = torch.zeros(1, dtype=torch.long, device=model.device)
+                        dist.recv(idx_tensor_recv, src=0)
+                        ctx = torch.cat((ctx, idx_tensor_recv.view(1, 1)), dim=1)
                     
-                    # Rank 0 receives token and prints
-                    if rank == 0:
+                    # Rank 0: receives token, prints, and sends back to Rank 1
+                    elif rank == 0:
                         idx_tensor = torch.zeros(1, dtype=torch.long, device=model.device)
                         dist.recv(idx_tensor, src=1)
                         idx = idx_tensor.item()
+                        
+                        # Print the token
                         try:
                             print(enc.decode([idx]), end="", flush=True)
                         except:
                             print(f"{idx} ", end="", flush=True)
-                    else:
-                        # Rank 1 waits for token index
-                        idx_tensor = torch.zeros(1, dtype=torch.long, device=model.device)
-                    
-                    # Broadcast token from rank 0 to all (so rank 1 can update context too)
-                    dist.broadcast(idx_tensor, src=0)
-                    ctx = torch.cat((ctx, idx_tensor.view(1, 1)), dim=1)
+                        
+                        # Send token back to Rank 1 so it can update context
+                        dist.send(idx_tensor.contiguous(), dst=1)
+                        ctx = torch.cat((ctx, idx_tensor.view(1, 1)), dim=1)
                 
             if rank == 0:
                 print("\n---\n")
