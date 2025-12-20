@@ -594,54 +594,53 @@ def main():
                 print(f"val loss {val_loss:.6f}")
             model.train()
         
-        # Sampling (both ranks participate)
+        # Sampling (matching NVSHMEM's approach)
         if (step > 0 and step % args.s == 0) or last_step:
             model.eval()
             if rank == 0:
                 print("generating:\n---")
             
-            # Reduce generation length to avoid timeout during debugging
-            gen_length = min(args.g, 10)
-            
             with torch.no_grad():
-                # Both ranks start with same context
-                ctx = torch.tensor([[50256]], dtype=torch.long, device=f'cuda:{rank}')
+                # Initialize generation tokens with BOS token (50256)
+                gen_tokens = torch.full((1, args.g), 50256, dtype=torch.long, device=f'cuda:{rank}')
                 
-                for t_gen in range(1, gen_length):
-                    if rank == 0 and t_gen % 5 == 0:
-                        print(f"[gen {t_gen}/{gen_length}]", flush=True)
-                    
-                    # Both ranks process the same context
+                for t in range(1, args.g):
+                    # Both ranks do forward pass with current context
+                    # Context is gen_tokens[:, :t]
+                    ctx = gen_tokens[:, :t]
                     logits, _ = model.forward_sequential(ctx, targets=None, verbose=False)
                     
-                    # Rank 1: samples token and sends to Rank 0
-                    if rank == 1:
-                        next_logits = logits[0, -1, :]
+                    # Only rank 1 (last) has logits and samples
+                    if rank == world_size - 1:
+                        # Get logits for last position
+                        next_logits = logits[0, -1, :]  # Shape: [vocab_size]
                         probs = F.softmax(next_logits, dim=-1)
-                        idx_tensor = torch.multinomial(probs, 1)
-                        dist.send(idx_tensor.contiguous(), dst=0)
+                        next_token = torch.multinomial(probs, 1)  # Shape: [1]
                         
-                        # Rank 1: receives the same token back from Rank 0 to stay in sync
-                        idx_tensor_recv = torch.zeros(1, dtype=torch.long, device=model.device)
-                        dist.recv(idx_tensor_recv, src=0)
-                        ctx = torch.cat((ctx, idx_tensor_recv.view(1, 1)), dim=1)
+                        # Send single token to rank 0
+                        dist.send(next_token.contiguous(), dst=0)
+                        
+                        # Update local gen_tokens
+                        gen_tokens[0, t] = next_token.item()
                     
-                    # Rank 0: receives token, prints, and sends back to Rank 1
-                    elif rank == 0:
-                        idx_tensor = torch.zeros(1, dtype=torch.long, device=model.device)
-                        dist.recv(idx_tensor, src=1)
-                        idx = idx_tensor.item()
+                    # Rank 0 receives token and prints
+                    if rank == 0:
+                        next_token = torch.zeros(1, dtype=torch.long, device=model.device)
+                        dist.recv(next_token, src=world_size - 1)
+                        token_id = next_token.item()
                         
                         # Print the token
                         try:
-                            print(enc.decode([idx]), end="", flush=True)
+                            print(enc.decode([token_id]), end="", flush=True)
                         except:
-                            print(f"{idx} ", end="", flush=True)
+                            print(f"{token_id} ", end="", flush=True)
                         
-                        # Send token back to Rank 1 so it can update context
-                        dist.send(idx_tensor.contiguous(), dst=1)
-                        ctx = torch.cat((ctx, idx_tensor.view(1, 1)), dim=1)
-                
+                        # Update local gen_tokens
+                        gen_tokens[0, t] = token_id
+                    
+                    # Barrier to ensure both ranks have updated gen_tokens before next iteration
+                    dist.barrier()
+            
             if rank == 0:
                 print("\n---\n")
             model.train()
