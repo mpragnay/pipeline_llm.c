@@ -422,9 +422,7 @@ class NCCLPipelineGPT2(nn.Module):
             # Store for return
             self.final_logits = logits
         
-        # Barrier at end
-        print(f"[Rank {self.rank}] forward_inference: Waiting at barrier", flush=True)
-        dist.barrier()
+        # No barrier here - generation loop handles synchronization
         print(f"[Rank {self.rank}] forward_inference: END", flush=True)
         
         # Return logits only from last rank
