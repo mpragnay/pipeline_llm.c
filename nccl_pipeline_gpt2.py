@@ -373,6 +373,50 @@ class NCCLPipelineGPT2(nn.Module):
         if self.rank == self.world_size - 1:
             return self.final_logits, self.final_loss
         return None, None
+    
+    def forward_inference(self, inputs):
+        """
+        Inference-only forward pass without autograd.
+        Uses raw dist.send/recv instead of autograd functions.
+        """
+        B, T = inputs.size()
+        self.allocate_buffers(B, T)
+        C = self.config.n_embd
+        
+        # Rank 0 processes first
+        if self.rank == 0:
+            inputs_device = inputs.to(self.device)
+            pos = torch.arange(0, T, dtype=torch.long, device=self.device)
+            x = self.wte(inputs_device) + self.wpe(pos)
+            
+            for block in self.blocks:
+                x = block(x)
+            
+            # Send to rank 1 (no autograd tracking)
+            dist.send(x.contiguous(), dst=1)
+        
+        # Rank 1 receives and processes
+        elif self.rank == 1:
+            dist.recv(self.activation_buffer, src=0)
+            x = self.activation_buffer.clone()
+            
+            for block in self.blocks:
+                x = block(x)
+            
+            # Last rank: compute logits
+            x = self.ln_f(x)
+            logits = self.lm_head(x)
+            
+            # Store for return
+            self.final_logits = logits
+        
+        # Barrier at end
+        dist.barrier()
+        
+        # Return logits only from last rank
+        if self.rank == self.world_size - 1:
+            return self.final_logits
+        return None
 
     def backward_sequential(self):
         """
@@ -615,7 +659,7 @@ def main():
                     # Context is gen_tokens[:, :t]
                     ctx = gen_tokens[:, :t]
                     print(f"[Rank {rank}] Step {t}: Starting forward, ctx shape {ctx.shape}", flush=True)
-                    logits, _ = model.forward_sequential(ctx, targets=None, verbose=False)
+                    logits = model.forward_inference(ctx)
                     print(f"[Rank {rank}] Step {t}: Forward complete", flush=True)
                     
                     # Only rank 1 (last) has logits and samples
