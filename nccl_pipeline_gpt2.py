@@ -680,9 +680,9 @@ def main():
                         print(f"[Rank {rank}] Step {t}: Sampling token", flush=True)
                         next_logits = logits[0, -1, :]  # Shape: [vocab_size]
                         print(f"[Rank {rank}] Step {t}: Got next_logits", flush=True)
-                        probs = F.softmax(next_logits, dim=-1)
-                        print(f"[Rank {rank}] Step {t}: Computed probs", flush=True)
-                        next_token = torch.multinomial(probs, 1)  # Shape: [1]
+                        
+                        # Use greedy sampling (argmax) instead of multinomial to avoid RNG hang
+                        next_token = torch.argmax(next_logits, dim=-1, keepdim=True)  # Shape: [1]
                         print(f"[Rank {rank}] Step {t}: Sampled token={next_token.item()}", flush=True)
                         
                         # Send single token to rank 0
