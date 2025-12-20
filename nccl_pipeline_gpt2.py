@@ -24,6 +24,48 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
+# -----------------------------------------------------------------------------
+# Custom Autograd Functions for NCCL Send/Recv with Gradient Flow
+# -----------------------------------------------------------------------------
+
+class NCCLSendFunction(torch.autograd.Function):
+    """Send activation forward, receive gradient backward"""
+    @staticmethod
+    def forward(ctx, tensor, dst):
+        ctx.dst = dst
+        dist.send(tensor.contiguous(), dst=dst)
+        return tensor
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Receive gradient from destination
+        grad_input = torch.zeros_like(grad_output)
+        dist.recv(grad_input, src=ctx.dst)
+        return grad_input, None
+
+class NCCLRecvFunction(torch.autograd.Function):
+    """Receive activation forward, send gradient backward"""
+    @staticmethod
+    def forward(ctx, buffer, src):
+        ctx.src = src
+        ctx.shape = buffer.shape
+        dist.recv(buffer, src=src)
+        return buffer
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Send gradient back to source
+        dist.send(grad_output.contiguous(), dst=ctx.src)
+        return None, None
+
+def nccl_send(tensor, dst):
+    """Send tensor with gradient support"""
+    return NCCLSendFunction.apply(tensor, dst)
+
+def nccl_recv(buffer, src):
+    """Receive tensor with gradient support"""
+    return NCCLRecvFunction.apply(buffer, src)
+
 class GPT2Config:
     def __init__(self, vocab_size=50257, n_layer=12, n_head=12, n_embd=768, block_size=1024, bias=True, padded_vocab_size=None):
         self.vocab_size = vocab_size
@@ -281,7 +323,7 @@ class NCCLPipelineGPT2(nn.Module):
             
             if verbose:
                 print(f"[Rank {self.rank}] Sending to rank 1")
-            dist.send(x.contiguous(), dst=1)
+            x = nccl_send(x, dst=1)
             if verbose:
                 print(f"[Rank {self.rank}] Sent to rank 1")
         
@@ -289,7 +331,7 @@ class NCCLPipelineGPT2(nn.Module):
         elif self.rank == 1:
             if verbose:
                 print(f"[Rank {self.rank}] Waiting to receive from rank 0")
-            dist.recv(self.activation_buffer, src=0)
+            x = nccl_recv(self.activation_buffer, src=0)
             if verbose:
                 print(f"[Rank {self.rank}] Received from rank 0")
             x = self.activation_buffer.clone()
