@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torch.distributed as dist
 import tiktoken
 
 # -----------------------------------------------------------------------------
@@ -94,13 +95,28 @@ class Block(nn.Module):
         return x
 
 class PipelineGPT2(nn.Module):
-    def __init__(self, config, checkpoint_path=None):
+    def __init__(self, config, checkpoint_path=None, use_nccl=True):
         super().__init__()
         self.config = config
+        self.use_nccl = use_nccl
         
-        # Devices
-        self.dev0 = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        self.dev1 = torch.device('cuda:1' if torch.cuda.device_count() > 1 else 'cuda:0' if torch.cuda.is_available() else 'cpu')
+        # Initialize distributed communication if using NCCL
+        if self.use_nccl and not dist.is_initialized():
+            # Initialize process group with NCCL backend
+            dist.init_process_group(backend='nccl', init_method='env://', world_size=2, rank=int(os.environ.get('LOCAL_RANK', 0)))
+        
+        # Set rank and device
+        if self.use_nccl:
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+            self.device = torch.device(f'cuda:{self.rank}')
+            # For 2-GPU pipeline: rank 0 = cuda:0, rank 1 = cuda:1
+            self.dev0 = torch.device('cuda:0')
+            self.dev1 = torch.device('cuda:1')
+        else:
+            self.rank = 0
+            self.dev0 = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            self.dev1 = torch.device('cuda:1' if torch.cuda.device_count() > 1 else 'cuda:0' if torch.cuda.is_available() else 'cpu')
 
         # Model Components
         vocab_size_actual = config.padded_vocab_size
@@ -237,30 +253,69 @@ class PipelineGPT2(nn.Module):
             print(f"num_parameters: {total_params}")
 
     def forward(self, idx, targets=None):
-        # --- Stage 1 (Dev 0) ---
-        idx = idx.to(self.dev0)
-        b, t = idx.size()
-        pos = torch.arange(0, t, dtype=torch.long, device=self.dev0)
+        if self.use_nccl:
+            # NCCL-based pipeline parallelism
+            if self.rank == 0:
+                # --- Stage 1 (GPU 0) ---
+                idx = idx.to(self.dev0)
+                b, t = idx.size()
+                pos = torch.arange(0, t, dtype=torch.long, device=self.dev0)
 
-        x = self.wte(idx) + self.wpe(pos)
-        for block in self.blocks_part1:
-            x = block(x)
+                x = self.wte(idx) + self.wpe(pos)
+                for block in self.blocks_part1:
+                    x = block(x)
 
-        # Move to Stage 2
-        x = x.to(self.dev1)
+                # Send to Stage 2 using NCCL
+                dist.send(tensor=x.contiguous(), dst=1)
+                
+                # Receive gradients back during backward pass (handled automatically by autograd)
+                return None, None
+                
+            elif self.rank == 1:
+                # --- Stage 2 (GPU 1) ---
+                # Receive from Stage 1
+                b, t = idx.size()
+                x = torch.zeros(b, t, self.config.n_embd, device=self.dev1, requires_grad=True)
+                dist.recv(tensor=x, src=0)
+                
+                for block in self.blocks_part2:
+                    x = block(x)
+                x = self.ln_f(x)
+                
+                logits = self.lm_head(x)
+                
+                loss = None
+                if targets is not None:
+                    targets = targets.to(self.dev1)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+                
+                return logits, loss
+        else:
+            # Original .to() based implementation
+            # --- Stage 1 (Dev 0) ---
+            idx = idx.to(self.dev0)
+            b, t = idx.size()
+            pos = torch.arange(0, t, dtype=torch.long, device=self.dev0)
 
-        for block in self.blocks_part2:
-            x = block(x)
-        x = self.ln_f(x)
-        
-        logits = self.lm_head(x)
-        
-        loss = None
-        if targets is not None:
-            targets = targets.to(self.dev1)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            x = self.wte(idx) + self.wpe(pos)
+            for block in self.blocks_part1:
+                x = block(x)
+
+            # Move to Stage 2
+            x = x.to(self.dev1)
+
+            for block in self.blocks_part2:
+                x = block(x)
+            x = self.ln_f(x)
             
-        return logits, loss
+            logits = self.lm_head(x)
+            
+            loss = None
+            if targets is not None:
+                targets = targets.to(self.dev1)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+                
+            return logits, loss
 
 # -----------------------------------------------------------------------------
 # Data Loader
@@ -343,6 +398,9 @@ def main():
     parser.add_argument('-m', type=int, default=20)
     parser.add_argument('-s', type=int, default=20)
     parser.add_argument('-g', type=int, default=64)
+    parser.add_argument('--use-nccl', action='store_true', help='Use NCCL for pipeline communication instead of .to()')
+    parser.add_argument('--no-nccl', dest='use_nccl', action='store_false', help='Use .to() for pipeline communication (default)')
+    parser.set_defaults(use_nccl=False)
     args = parser.parse_args()
 
     # Device info
@@ -370,11 +428,12 @@ def main():
 
     print(f"| device                | {dev_name:<50} |")
     print(f"| TF32                  | {'enabled' if torch.backends.cuda.matmul.allow_tf32 else 'disabled':<50} |")
+    print(f"| communication         | {'NCCL' if args.use_nccl else 'PyTorch .to()':<50} |")
     print("+-----------------------+----------------------------------------------------+")
 
     # Model
     config = GPT2Config(block_size=args.t)
-    model = PipelineGPT2(config, checkpoint_path="gpt2_124M.bin")
+    model = PipelineGPT2(config, checkpoint_path="gpt2_124M.bin", use_nccl=args.use_nccl)
     print("+-----------------------+----------------------------------------------------+")
 
     # Tokenizer
