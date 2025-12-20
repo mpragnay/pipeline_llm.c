@@ -176,6 +176,20 @@ class NCCLPipelineGPT2(nn.Module):
                 print(f"num_layers: {L}, num_heads: {NH}, channels: {C}")
                 print(f"Rank {self.rank}: layers {self.first_layer}-{self.first_layer + self.num_layers - 1}")
             
+            # Resize embeddings if needed
+            if Vp != self.config.padded_vocab_size:
+                if self.rank == 0:
+                    print(f"Resizing vocab from {self.config.padded_vocab_size} to {Vp}")
+                self.config.padded_vocab_size = Vp
+                self.config.vocab_size = V
+                
+                # Recreate embeddings with correct size
+                if self.has_embedding:
+                    self.wte = nn.Embedding(Vp, C).to(self.device)
+                    self.wpe = nn.Embedding(maxT, C).to(self.device)
+                if self.has_final_ln:
+                    self.lm_head = nn.Linear(C, Vp, bias=False).to(self.device)
+            
             def read_tensor(shape):
                 numel = int(np.prod(shape))
                 raw = f.read(numel * 4)
