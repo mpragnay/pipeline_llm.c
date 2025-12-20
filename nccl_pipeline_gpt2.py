@@ -660,9 +660,8 @@ def main():
                     if rank == world_size - 1:
                         # Get logits for last position and sample
                         next_logits = logits[0, -1, :]  # Shape: [vocab_size]
-                        next_logits_cpu = next_logits.cpu()
-                        next_token_cpu = torch.argmax(next_logits_cpu, dim=-1, keepdim=True)  # Shape: [1]
-                        next_token = next_token_cpu.to(model.device)
+                        probs = F.softmax(next_logits, dim=-1)
+                        next_token = torch.multinomial(probs, 1)  # Random sampling
                         gen_tokens[0, t] = next_token.item()
                     else:
                         # Other ranks prepare to receive
