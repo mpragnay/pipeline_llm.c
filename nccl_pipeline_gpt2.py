@@ -538,6 +538,7 @@ def main():
     parser.add_argument('-m', type=int, default=20)
     parser.add_argument('-s', type=int, default=20, help='sample generation every N steps')
     parser.add_argument('-g', type=int, default=64, help='generation length')
+    parser.add_argument('-c', '--num-chunks', type=int, default=1, help='number of micro-batches for pipeline parallelism (default=1, no micro-batching)')
     parser.add_argument('--verbose', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
     
@@ -569,6 +570,7 @@ def main():
         print(f"| val_max_steps         | {args.m:<50} |")
         print(f"| sample_every          | {args.s:<50} |")
         print(f"| genT                  | {args.g:<50} |")
+        print(f"| num_chunks (micro-b)  | {args.num_chunks:<50} |")
         print(f"| communication         | {'NCCL (barrier-synchronized)':<50} |")
         print(f"| world_size            | {world_size:<50} |")
         print("+-----------------------+----------------------------------------------------+")
@@ -693,7 +695,7 @@ def main():
         if last_step:
             break
             
-        # Training step
+        # Training step with micro-batching
         if verbose:
             print(f"[Rank {rank}] Training step {step}")
         if rank == 0:
@@ -702,34 +704,52 @@ def main():
         if verbose:
             print(f"[Rank {rank}] Loading batch")
         x, y = train_loader.next_batch()
-        if verbose:
-            print(f"[Rank {rank}] Batch loaded, zeroing gradients")
-        optimizer.zero_grad(set_to_none=True)
         
-        # Forward pass (barrier-synchronized)
-        if verbose:
-            print(f"[Rank {rank}] Starting forward pass")
-        logits, loss = model.forward_sequential(x, y, verbose=verbose)
-        if verbose:
-            print(f"[Rank {rank}] Forward pass complete")
+        # Micro-batching: split batch into chunks
+        num_chunks = args.num_chunks
+        if args.b % num_chunks != 0:
+            if rank == 0:
+                print(f"Warning: batch size {args.b} not divisible by num_chunks {num_chunks}, using num_chunks=1")
+            num_chunks = 1
         
-        # Backward pass (only last rank has loss)
-        if rank == world_size - 1 and loss is not None:
+        chunk_size = args.b // num_chunks
+        
+        # Zero gradients before accumulation
+        optimizer.zero_grad(set_to_none=False)  # Keep grad buffers for accumulation
+        
+        # Process each micro-batch and accumulate gradients
+        accumulated_loss = 0.0
+        for chunk_idx in range(num_chunks):
             if verbose:
-                print(f"[Rank {rank}] Starting backward pass")
-            loss.backward()
-            if verbose:
-                print(f"[Rank {rank}] Backward pass complete")
+                print(f"[Rank {rank}] Processing micro-batch {chunk_idx+1}/{num_chunks}")
+            
+            # Extract micro-batch
+            start_idx = chunk_idx * chunk_size
+            end_idx = start_idx + chunk_size
+            x_chunk = x[start_idx:end_idx]
+            y_chunk = y[start_idx:end_idx]
+            
+            # Forward pass
+            logits, loss = model.forward_sequential(x_chunk, y_chunk, verbose=verbose)
+            
+            # Backward pass (only last rank has loss)
+            if rank == world_size - 1 and loss is not None:
+                # Scale loss by num_chunks for proper gradient averaging
+                scaled_loss = loss / num_chunks
+                scaled_loss.backward()
+                accumulated_loss += loss.item()
         
-        # All ranks update their parameters
+        # All ranks synchronize before optimizer step
         if verbose:
             print(f"[Rank {rank}] Waiting at barrier before optimizer.step()")
         dist.barrier()
-        if verbose:
-            print(f"[Rank {rank}] Passed barrier, calling optimizer.step()")
+        
+        # Update parameters with accumulated gradients
         optimizer.step()
-        if verbose:
-            print(f"[Rank {rank}] optimizer.step() complete")
+        
+        # Clear gradients for next iteration  
+        optimizer.zero_grad(set_to_none=True)
+        
         dist.barrier()
         
         if rank == 0:
@@ -738,9 +758,10 @@ def main():
             dt = t1 - t0
             total_sum_time += dt
         
-        # Broadcast loss for logging
+        # Broadcast loss for logging (use accumulated loss averaged over chunks)
         if rank == world_size - 1:
-            loss_tensor = torch.tensor([loss.item()], device=f'cuda:{rank}')
+            avg_loss = accumulated_loss / num_chunks
+            loss_tensor = torch.tensor([avg_loss], device=f'cuda:{rank}')
         else:
             loss_tensor = torch.tensor([0.0], device=f'cuda:{rank}')
         dist.broadcast(loss_tensor, src=world_size - 1)
