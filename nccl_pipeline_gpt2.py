@@ -674,7 +674,12 @@ def main():
                     logits = model.forward_inference(ctx)
                     print(f"[Rank {rank}] Step {t}: Forward complete", flush=True)
                     
-                    # CRITICAL: Synchronize CUDA before any CPU operations to avoid deadlock
+                    # CRITICAL: Barrier to ensure all distributed communication completes
+                    print(f"[Rank {rank}] Step {t}: Waiting at post-forward barrier", flush=True)
+                    dist.barrier()
+                    print(f"[Rank {rank}] Step {t}: Passed post-forward barrier", flush=True)
+                    
+                    # Now safe to synchronize CUDA
                     torch.cuda.synchronize()
                     print(f"[Rank {rank}] Step {t}: CUDA synchronized", flush=True)
                     
