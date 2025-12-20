@@ -600,34 +600,47 @@ def main():
             if rank == 0:
                 print("generating:\n---")
             
+            print(f"[Rank {rank}] Starting generation", flush=True)
+            
             with torch.no_grad():
                 # Initialize generation tokens with BOS token (50256)
                 gen_tokens = torch.full((1, args.g), 50256, dtype=torch.long, device=f'cuda:{rank}')
+                print(f"[Rank {rank}] Initialized gen_tokens", flush=True)
                 
                 for t in range(1, args.g):
+                    if rank == 0 and t % 10 == 0:
+                        print(f"[Rank {rank}] Generation step {t}/{args.g}", flush=True)
+                    
                     # Both ranks do forward pass with current context
                     # Context is gen_tokens[:, :t]
                     ctx = gen_tokens[:, :t]
+                    print(f"[Rank {rank}] Step {t}: Starting forward, ctx shape {ctx.shape}", flush=True)
                     logits, _ = model.forward_sequential(ctx, targets=None, verbose=False)
+                    print(f"[Rank {rank}] Step {t}: Forward complete", flush=True)
                     
                     # Only rank 1 (last) has logits and samples
                     if rank == world_size - 1:
                         # Get logits for last position
+                        print(f"[Rank {rank}] Step {t}: Sampling token", flush=True)
                         next_logits = logits[0, -1, :]  # Shape: [vocab_size]
                         probs = F.softmax(next_logits, dim=-1)
                         next_token = torch.multinomial(probs, 1)  # Shape: [1]
                         
                         # Send single token to rank 0
+                        print(f"[Rank {rank}] Step {t}: Sending token {next_token.item()}", flush=True)
                         dist.send(next_token.contiguous(), dst=0)
+                        print(f"[Rank {rank}] Step {t}: Token sent", flush=True)
                         
                         # Update local gen_tokens
                         gen_tokens[0, t] = next_token.item()
                     
                     # Rank 0 receives token and prints
                     if rank == 0:
+                        print(f"[Rank {rank}] Step {t}: Waiting for token", flush=True)
                         next_token = torch.zeros(1, dtype=torch.long, device=model.device)
                         dist.recv(next_token, src=world_size - 1)
                         token_id = next_token.item()
+                        print(f"[Rank {rank}] Step {t}: Received token {token_id}", flush=True)
                         
                         # Print the token
                         try:
@@ -639,8 +652,11 @@ def main():
                         gen_tokens[0, t] = token_id
                     
                     # Barrier to ensure both ranks have updated gen_tokens before next iteration
+                    print(f"[Rank {rank}] Step {t}: Waiting at barrier", flush=True)
                     dist.barrier()
+                    print(f"[Rank {rank}] Step {t}: Passed barrier", flush=True)
             
+            print(f"[Rank {rank}] Generation complete", flush=True)
             if rank == 0:
                 print("\n---\n")
             model.train()
