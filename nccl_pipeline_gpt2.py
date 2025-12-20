@@ -710,10 +710,22 @@ def main():
                         # Update local gen_tokens
                         gen_tokens[0, t] = token_id
                     
+                    # Rank 0 broadcasts token to all other ranks
+                    print(f"[Rank {rank}] Step {t}: Broadcasting token", flush=True)
+                    token_to_broadcast = gen_tokens[0, t:t+1].clone()  # Shape: [1]
+                    dist.broadcast(token_to_broadcast, src=0)
+                    print(f"[Rank {rank}] Step {t}: Broadcast complete", flush=True)
+                    
+                    # All non-Rank-0 ranks receive broadcast
+                    if rank != 0:
+                        gen_tokens[0, t] = token_to_broadcast.item()
+                        print(f"[Rank {rank}] Step {t}: Updated gen_tokens[{t}] = {token_to_broadcast.item()}", flush=True)
+                    
                     # Barrier to ensure both ranks have updated gen_tokens before next iteration
                     print(f"[Rank {rank}] Step {t}: Waiting at barrier", flush=True)
                     dist.barrier()
                     print(f"[Rank {rank}] Step {t}: Passed barrier", flush=True)
+
             
             print(f"[Rank {rank}] Generation complete", flush=True)
             if rank == 0:
