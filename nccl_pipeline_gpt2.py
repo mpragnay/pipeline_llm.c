@@ -422,7 +422,9 @@ class NCCLPipelineGPT2(nn.Module):
             # Store for return
             self.final_logits = logits
         
-        # No barrier here - generation loop handles synchronization
+        # Barrier to ensure both ranks complete forward before returning
+        print(f"[Rank {self.rank}] forward_inference: Waiting at barrier", flush=True)
+        dist.barrier()
         print(f"[Rank {self.rank}] forward_inference: END", flush=True)
         
         # Return logits only from last rank
@@ -674,71 +676,50 @@ def main():
                     logits = model.forward_inference(ctx)
                     print(f"[Rank {rank}] Step {t}: Forward complete", flush=True)
                     
-                    # CRITICAL: Synchronize CUDA first, then barrier
+                    # CRITICAL: Synchronize CUDA
                     torch.cuda.synchronize()
                     print(f"[Rank {rank}] Step {t}: CUDA synchronized", flush=True)
-                    
-                    # Barrier to ensure all ranks ready before sampling
-                    print(f"[Rank {rank}] Step {t}: Waiting at post-forward barrier", flush=True)
-                    dist.barrier()
-                    print(f"[Rank {rank}] Step {t}: Passed post-forward barrier", flush=True)
                     
                     # Only rank 1 (last) has logits and samples
                     if rank == world_size - 1:
                         # Get logits for last position
                         print(f"[Rank {rank}] Step {t}: Sampling token", flush=True)
                         next_logits = logits[0, -1, :]  # Shape: [vocab_size]
-                        print(f"[Rank {rank}] Step {t}: Got next_logits", flush=True)
                         
                         # Move to CPU to avoid CUDA sync issues with argmax
                         next_logits_cpu = next_logits.cpu()
-                        print(f"[Rank {rank}] Step {t}: Moved logits to CPU", flush=True)
                         
                         # Use greedy sampling (argmax)
                         next_token_cpu = torch.argmax(next_logits_cpu, dim=-1, keepdim=True)  # Shape: [1]
                         next_token = next_token_cpu.to(model.device)
                         print(f"[Rank {rank}] Step {t}: Sampled token={next_token.item()}", flush=True)
                         
-                        # Send single token to rank 0
-                        print(f"[Rank {rank}] Step {t}: Sending token {next_token.item()}", flush=True)
-                        dist.send(next_token.contiguous(), dst=0)
-                        print(f"[Rank {rank}] Step {t}: Token sent", flush=True)
-                        
                         # Update local gen_tokens
                         gen_tokens[0, t] = next_token.item()
-                    
-                    # Rank 0 receives token and prints
-                    if rank == 0:
-                        print(f"[Rank {rank}] Step {t}: Waiting for token", flush=True)
+                    else:
+                        # Other ranks prepare to receive
                         next_token = torch.zeros(1, dtype=torch.long, device=model.device)
-                        dist.recv(next_token, src=world_size - 1)
-                        token_id = next_token.item()
-                        print(f"[Rank {rank}] Step {t}: Received token {token_id}", flush=True)
-                        
-                        # Print the token
+                    
+                    # Rank 1 broadcasts token to all ranks
+                    print(f"[Rank {rank}] Step {t}: Broadcasting token", flush=True)
+                    token_to_broadcast = torch.zeros(1, dtype=torch.long, device=model.device)
+                    if rank == world_size - 1:
+                        token_to_broadcast[0] = next_token.item()
+                    dist.broadcast(token_to_broadcast, src=world_size - 1)
+                    print(f"[Rank {rank}] Step {t}: Broadcast complete", flush=True)
+                    
+                    # Non-last ranks update gen_tokens
+                    if rank != world_size - 1:
+                        gen_tokens[0, t] = token_to_broadcast.item()
+                        print(f"[Rank {rank}] Step {t}: Updated gen_tokens[{t}] = {token_to_broadcast.item()}", flush=True)
+                    
+                    # Rank 0 prints the token
+                    if rank == 0:
+                        token_id = token_to_broadcast.item()
                         try:
                             print(enc.decode([token_id]), end="", flush=True)
                         except:
                             print(f"{token_id} ", end="", flush=True)
-                        
-                        # Update local gen_tokens
-                        gen_tokens[0, t] = token_id
-                    
-                    # Rank 0 broadcasts token to all other ranks
-                    print(f"[Rank {rank}] Step {t}: Broadcasting token", flush=True)
-                    token_to_broadcast = gen_tokens[0, t:t+1].clone()  # Shape: [1]
-                    dist.broadcast(token_to_broadcast, src=0)
-                    print(f"[Rank {rank}] Step {t}: Broadcast complete", flush=True)
-                    
-                    # All non-Rank-0 ranks receive broadcast
-                    if rank != 0:
-                        gen_tokens[0, t] = token_to_broadcast.item()
-                        print(f"[Rank {rank}] Step {t}: Updated gen_tokens[{t}] = {token_to_broadcast.item()}", flush=True)
-                    
-                    # Barrier to ensure both ranks have updated gen_tokens before next iteration
-                    print(f"[Rank {rank}] Step {t}: Waiting at barrier", flush=True)
-                    dist.barrier()
-                    print(f"[Rank {rank}] Step {t}: Passed barrier", flush=True)
 
             
             print(f"[Rank {rank}] Generation complete", flush=True)
