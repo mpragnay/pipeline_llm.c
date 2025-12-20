@@ -673,9 +673,10 @@ def main():
                     logits = model.forward_inference(ctx)
                     print(f"[Rank {rank}] Step {t}: Forward complete", flush=True)
                     
-                    # CRITICAL: Synchronize CUDA
-                    torch.cuda.synchronize()
-                    print(f"[Rank {rank}] Step {t}: CUDA synchronized", flush=True)
+                    # Barrier to ensure both ranks ready before sampling/broadcast
+                    print(f"[Rank {rank}] Step {t}: Waiting at barrier before sampling", flush=True)
+                    dist.barrier()
+                    print(f"[Rank {rank}] Step {t}: Passed barrier", flush=True)
                     
                     # Only rank 1 (last) has logits and samples
                     if rank == world_size - 1:
