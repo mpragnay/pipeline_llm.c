@@ -380,6 +380,9 @@ class DataLoader:
             
     def next_batch(self):
         """Only rank 0 loads, broadcasts to all"""
+        # Get device for this rank
+        device = torch.device(f'cuda:{self.rank}')
+        
         if self.rank == 0:
             if self.current_sample_idx >= len(self.indices):
                 self.current_shard_idx = (self.current_shard_idx + 1) % len(self.files)
@@ -390,16 +393,16 @@ class DataLoader:
             offset = idx * self.B * self.T
             
             chunk = self.tokens[offset : offset + self.B * self.T + 1].astype(np.int64)
-            x = torch.from_numpy(chunk[:-1]).view(self.B, self.T)
-            y = torch.from_numpy(chunk[1:]).view(self.B, self.T)
+            x = torch.from_numpy(chunk[:-1]).view(self.B, self.T).to(device)
+            y = torch.from_numpy(chunk[1:]).view(self.B, self.T).to(device)
             
             self.current_sample_idx += 1
         else:
-            # Other ranks create placeholder
-            x = torch.zeros(self.B, self.T, dtype=torch.long)
-            y = torch.zeros(self.B, self.T, dtype=torch.long)
+            # Other ranks create placeholder on GPU
+            x = torch.zeros(self.B, self.T, dtype=torch.long, device=device)
+            y = torch.zeros(self.B, self.T, dtype=torch.long, device=device)
         
-        # Broadcast from rank 0 to all
+        # Broadcast from rank 0 to all (NCCL requires GPU tensors)
         dist.broadcast(x, src=0)
         dist.broadcast(y, src=0)
         
@@ -467,10 +470,10 @@ def main():
         train_num_batches = 10  # Will be synced via barrier
         val_num_batches = args.m
     
-    # Broadcast batch counts
-    batch_counts = torch.tensor([train_num_batches, val_num_batches], dtype=torch.long)
+    # Broadcast batch counts (NCCL requires GPU tensors)
+    batch_counts = torch.tensor([train_num_batches, val_num_batches], dtype=torch.long, device=f'cuda:{rank}')
     dist.broadcast(batch_counts, src=0)
-    train_num_batches, val_num_batches = batch_counts.tolist()
+    train_num_batches, val_num_batches = batch_counts.cpu().tolist()
 
     # Optimizer (each rank only optimizes its parameters)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.l, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
