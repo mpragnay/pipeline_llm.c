@@ -260,14 +260,15 @@ class NCCLPipelineGPT2(nn.Module):
         # Sequential forward pass (matching NVSHMEM)
         for target_rank in range(self.world_size):
             if self.rank == target_rank:
-                if self.rank == 0:
+                # Receive from previous rank BEFORE processing (except rank 0)
+                if self.rank > 0:
+                    dist.recv(self.activation_buffer, src=self.rank - 1)
+                    x = self.activation_buffer.clone()
+                else:
                     # Rank 0: embedding
                     inputs_device = inputs.to(self.device)
                     pos = torch.arange(0, T, dtype=torch.long, device=self.device)
                     x = self.wte(inputs_device) + self.wpe(pos)
-                else:
-                    # Other ranks: receive from previous
-                    x = self.activation_buffer.clone()
                 
                 # Process this rank's layers
                 for block in self.blocks:
@@ -289,10 +290,6 @@ class NCCLPipelineGPT2(nn.Module):
                     # Store for backward
                     self.final_logits = logits
                     self.final_loss = loss
-                    
-                # Receive activation for next iteration (except last rank)
-                if self.rank > 0 and target_rank == self.rank - 1:
-                    dist.recv(self.activation_buffer, src=self.rank - 1)
             
             dist.barrier()  # All ranks wait (matching nvshmem_barrier_all)
         
