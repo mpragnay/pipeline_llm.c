@@ -381,52 +381,66 @@ class NCCLPipelineGPT2(nn.Module):
         """
         print(f"[Rank {self.rank}] forward_inference: START", flush=True)
         B, T = inputs.size()
+        print(f"[Rank {self.rank}] forward_inference: B={B}, T={T}", flush=True)
         self.allocate_buffers(B, T)
+        print(f"[Rank {self.rank}] forward_inference: Buffers allocated", flush=True)
         C = self.config.n_embd
         
         # Rank 0 processes first
         if self.rank == 0:
             print(f"[Rank {self.rank}] forward_inference: Rank 0 processing", flush=True)
             inputs_device = inputs.to(self.device)
+            print(f"[Rank {self.rank}] forward_inference: Inputs moved to device", flush=True)
             pos = torch.arange(0, T, dtype=torch.long, device=self.device)
             x = self.wte(inputs_device) + self.wpe(pos)
+            print(f"[Rank {self.rank}] forward_inference: Embeddings computed", flush=True)
             
             print(f"[Rank {self.rank}] forward_inference: Processing {len(self.blocks)} blocks", flush=True)
-            for block in self.blocks:
+            for i, block in enumerate(self.blocks):
                 x = block(x)
-            print(f"[Rank {self.rank}] forward_inference: Blocks done", flush=True)
+                print(f"[Rank {self.rank}] forward_inference: Block {i} done", flush=True)
+            print(f"[Rank {self.rank}] forward_inference: All blocks done", flush=True)
             
             # Send to rank 1 (no autograd tracking)
-            print(f"[Rank {self.rank}] forward_inference: Sending to rank 1", flush=True)
+            print(f"[Rank {self.rank}] forward_inference: About to send to rank 1, x.shape={x.shape}", flush=True)
+            print(f"[Rank {self.rank}] forward_inference: Calling dist.send...", flush=True)
             dist.send(x.contiguous(), dst=1)
-            print(f"[Rank {self.rank}] forward_inference: Sent to rank 1", flush=True)
+            print(f"[Rank {self.rank}] forward_inference: dist.send RETURNED", flush=True)
         
         # Rank 1 receives and processes
         elif self.rank == 1:
-            print(f"[Rank {self.rank}] forward_inference: Rank 1 receiving", flush=True)
+            print(f"[Rank {self.rank}] forward_inference: Rank 1 about to receive", flush=True)
+            print(f"[Rank {self.rank}] forward_inference: Calling dist.recv...", flush=True)
             dist.recv(self.activation_buffer, src=0)
-            print(f"[Rank {self.rank}] forward_inference: Received from rank 0", flush=True)
+            print(f"[Rank {self.rank}] forward_inference: dist.recv RETURNED", flush=True)
             x = self.activation_buffer.clone()
+            print(f"[Rank {self.rank}] forward_inference: Cloned activation buffer", flush=True)
             
             print(f"[Rank {self.rank}] forward_inference: Processing {len(self.blocks)} blocks", flush=True)
-            for block in self.blocks:
+            for i, block in enumerate(self.blocks):
                 x = block(x)
-            print(f"[Rank {self.rank}] forward_inference: Blocks done", flush=True)
+                print(f"[Rank {self.rank}] forward_inference: Block {i} done", flush=True)
+            print(f"[Rank {self.rank}] forward_inference: All blocks done", flush=True)
             
             # Last rank: compute logits
             print(f"[Rank {self.rank}] forward_inference: Computing logits", flush=True)
             x = self.ln_f(x)
+            print(f"[Rank {self.rank}] forward_inference: ln_f done", flush=True)
             logits = self.lm_head(x)
-            print(f"[Rank {self.rank}] forward_inference: Logits computed", flush=True)
+            print(f"[Rank {self.rank}] forward_inference: lm_head done, logits.shape={logits.shape}", flush=True)
             
             # Store for return
             self.final_logits = logits
+            print(f"[Rank {self.rank}] forward_inference: final_logits stored", flush=True)
         
+        print(f"[Rank {self.rank}] forward_inference: About to return", flush=True)
         print(f"[Rank {self.rank}] forward_inference: END", flush=True)
         
         # Return logits only from last rank
         if self.rank == self.world_size - 1:
+            print(f"[Rank {self.rank}] forward_inference: Returning logits", flush=True)
             return self.final_logits
+        print(f"[Rank {self.rank}] forward_inference: Returning None", flush=True)
         return None
 
     def backward_sequential(self):
@@ -663,48 +677,61 @@ def main():
                 print(f"[Rank {rank}] Initialized gen_tokens", flush=True)
                 
                 for t in range(1, args.g):
-                    if rank == 0 and t % 10 == 0:
-                        print(f"[Rank {rank}] Generation step {t}/{args.g}", flush=True)
+                    print(f"\n[Rank {rank}] ========== GENERATION STEP {t}/{args.g} ==========\n", flush=True)
                     
                     # Both ranks do forward pass with current context
                     # Context is gen_tokens[:, :t]
                     ctx = gen_tokens[:, :t]
-                    print(f"[Rank {rank}] Step {t}: Starting forward, ctx shape {ctx.shape}", flush=True)
+                    print(f"[Rank {rank}] Step {t}: ctx = gen_tokens[:, :{t}], shape {ctx.shape}", flush=True)
+                    print(f"[Rank {rank}] Step {t}: Calling forward_inference...", flush=True)
                     logits = model.forward_inference(ctx)
-                    print(f"[Rank {rank}] Step {t}: Forward complete", flush=True)
+                    print(f"[Rank {rank}] Step {t}: forward_inference RETURNED, logits={type(logits)}", flush=True)
                     
                     # Barrier to ensure both ranks ready before sampling/broadcast
-                    print(f"[Rank {rank}] Step {t}: Waiting at barrier before sampling", flush=True)
-                    dist.barrier()
-                    print(f"[Rank {rank}] Step {t}: Passed barrier", flush=True)
+                    print(f"[Rank {rank}] Step {t}: About to call dist.barrier()...", flush=True)
+                    try:
+                        dist.barrier()
+                        print(f"[Rank {rank}] Step {t}: dist.barrier() RETURNED SUCCESSFULLY", flush=True)
+                    except Exception as e:
+                        print(f"[Rank {rank}] Step {t}: dist.barrier() EXCEPTION: {e}", flush=True)
+                        raise
                     
                     # Only rank 1 (last) has logits and samples
                     if rank == world_size - 1:
                         # Get logits for last position
-                        print(f"[Rank {rank}] Step {t}: Sampling token", flush=True)
+                        print(f"[Rank {rank}] Step {t}: Sampling from logits, shape={logits.shape}", flush=True)
                         next_logits = logits[0, -1, :]  # Shape: [vocab_size]
+                        print(f"[Rank {rank}] Step {t}: next_logits extracted, shape={next_logits.shape}", flush=True)
                         
                         # Move to CPU to avoid CUDA sync issues with argmax
+                        print(f"[Rank {rank}] Step {t}: Moving to CPU...", flush=True)
                         next_logits_cpu = next_logits.cpu()
+                        print(f"[Rank {rank}] Step {t}: Moved to CPU", flush=True)
                         
                         # Use greedy sampling (argmax)
+                        print(f"[Rank {rank}] Step {t}: Calling argmax...", flush=True)
                         next_token_cpu = torch.argmax(next_logits_cpu, dim=-1, keepdim=True)  # Shape: [1]
+                        print(f"[Rank {rank}] Step {t}: argmax done", flush=True)
                         next_token = next_token_cpu.to(model.device)
                         print(f"[Rank {rank}] Step {t}: Sampled token={next_token.item()}", flush=True)
                         
                         # Update local gen_tokens
                         gen_tokens[0, t] = next_token.item()
+                        print(f"[Rank {rank}] Step {t}: Updated gen_tokens[0, {t}] = {next_token.item()}", flush=True)
                     else:
                         # Other ranks prepare to receive
+                        print(f"[Rank {rank}] Step {t}: Creating placeholder for broadcast", flush=True)
                         next_token = torch.zeros(1, dtype=torch.long, device=model.device)
                     
                     # Rank 1 broadcasts token to all ranks
-                    print(f"[Rank {rank}] Step {t}: Broadcasting token", flush=True)
+                    print(f"[Rank {rank}] Step {t}: Preparing broadcast...", flush=True)
                     token_to_broadcast = torch.zeros(1, dtype=torch.long, device=model.device)
                     if rank == world_size - 1:
                         token_to_broadcast[0] = next_token.item()
+                        print(f"[Rank {rank}] Step {t}: Set token_to_broadcast[0] = {next_token.item()}", flush=True)
+                    print(f"[Rank {rank}] Step {t}: Calling dist.broadcast...", flush=True)
                     dist.broadcast(token_to_broadcast, src=world_size - 1)
-                    print(f"[Rank {rank}] Step {t}: Broadcast complete", flush=True)
+                    print(f"[Rank {rank}] Step {t}: dist.broadcast RETURNED", flush=True)
                     
                     # Non-last ranks update gen_tokens
                     if rank != world_size - 1:
