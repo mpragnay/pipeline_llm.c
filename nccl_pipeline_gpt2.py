@@ -681,8 +681,13 @@ def main():
                         next_logits = logits[0, -1, :]  # Shape: [vocab_size]
                         print(f"[Rank {rank}] Step {t}: Got next_logits", flush=True)
                         
-                        # Use greedy sampling (argmax) instead of multinomial to avoid RNG hang
-                        next_token = torch.argmax(next_logits, dim=-1, keepdim=True)  # Shape: [1]
+                        # Move to CPU to avoid CUDA sync issues with argmax
+                        next_logits_cpu = next_logits.cpu()
+                        print(f"[Rank {rank}] Step {t}: Moved logits to CPU", flush=True)
+                        
+                        # Use greedy sampling (argmax)
+                        next_token_cpu = torch.argmax(next_logits_cpu, dim=-1, keepdim=True)  # Shape: [1]
+                        next_token = next_token_cpu.to(model.device)
                         print(f"[Rank {rank}] Step {t}: Sampled token={next_token.item()}", flush=True)
                         
                         # Send single token to rank 0
