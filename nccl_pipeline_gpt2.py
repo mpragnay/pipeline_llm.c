@@ -248,12 +248,13 @@ class NCCLPipelineGPT2(nn.Module):
                     self.ln_f.weight.copy_(lnfw.to(self.device))
                     self.ln_f.bias.copy_(lnfb.to(self.device))
 
-    def forward_sequential(self, inputs, targets=None):
+    def forward_sequential(self, inputs, targets=None, verbose=False):
         """
         Barrier-synchronized forward pass matching NVSHMEM's architecture.
         Each rank processes sequentially with barriers between.
         """
-        print(f"[Rank {self.rank}] forward_sequential: START")
+        if verbose:
+            print(f"[Rank {self.rank}] forward_sequential: START")
         B, T = inputs.size()
         self.allocate_buffers(B, T)
         C = self.config.n_embd
@@ -261,39 +262,50 @@ class NCCLPipelineGPT2(nn.Module):
         # Process layers in sequence: rank 0, then rank 1
         # Rank 0 processes first
         if self.rank == 0:
-            print(f"[Rank {self.rank}] Computing embedding")
+            if verbose:
+                print(f"[Rank {self.rank}] Computing embedding")
             inputs_device = inputs.to(self.device)
             pos = torch.arange(0, T, dtype=torch.long, device=self.device)
             x = self.wte(inputs_device) + self.wpe(pos)
-            print(f"[Rank {self.rank}] Embedding computed")
+            if verbose:
+                print(f"[Rank {self.rank}] Embedding computed")
             
-            print(f"[Rank {self.rank}] Processing {len(self.blocks)} layers")
+            if verbose:
+                print(f"[Rank {self.rank}] Processing {len(self.blocks)} layers")
             for i, block in enumerate(self.blocks):
                 x = block(x)
-                if i % 2 == 0:
+                if verbose and i % 2 == 0:
                     print(f"[Rank {self.rank}] Processed layer {i}")
-            print(f"[Rank {self.rank}] All layers processed")
+            if verbose:
+                print(f"[Rank {self.rank}] All layers processed")
             
-            print(f"[Rank {self.rank}] Sending to rank 1")
+            if verbose:
+                print(f"[Rank {self.rank}] Sending to rank 1")
             dist.send(x.contiguous(), dst=1)
-            print(f"[Rank {self.rank}] Sent to rank 1")
+            if verbose:
+                print(f"[Rank {self.rank}] Sent to rank 1")
         
         # Rank 1 receives and processes
         elif self.rank == 1:
-            print(f"[Rank {self.rank}] Waiting to receive from rank 0")
+            if verbose:
+                print(f"[Rank {self.rank}] Waiting to receive from rank 0")
             dist.recv(self.activation_buffer, src=0)
-            print(f"[Rank {self.rank}] Received from rank 0")
+            if verbose:
+                print(f"[Rank {self.rank}] Received from rank 0")
             x = self.activation_buffer.clone()
             
-            print(f"[Rank {self.rank}] Processing {len(self.blocks)} layers")
+            if verbose:
+                print(f"[Rank {self.rank}] Processing {len(self.blocks)} layers")
             for i, block in enumerate(self.blocks):
                 x = block(x)
-                if i % 2 == 0:
+                if verbose and i % 2 == 0:
                     print(f"[Rank {self.rank}] Processed layer {i}")
-            print(f"[Rank {self.rank}] All layers processed")
+            if verbose:
+                print(f"[Rank {self.rank}] All layers processed")
             
             # Last rank: compute logits and loss
-            print(f"[Rank {self.rank}] Computing logits and loss")
+            if verbose:
+                print(f"[Rank {self.rank}] Computing logits and loss")
             x = self.ln_f(x)
             logits = self.lm_head(x)
             
@@ -301,16 +313,19 @@ class NCCLPipelineGPT2(nn.Module):
             if targets is not None:
                 targets_device = targets.to(self.device)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_device.view(-1))
-                print(f"[Rank {self.rank}] Loss computed: {loss.item():.6f}")
+                if verbose:
+                    print(f"[Rank {self.rank}] Loss computed: {loss.item():.6f}")
             
             # Store for backward
             self.final_logits = logits
             self.final_loss = loss
         
         # Barrier at end to ensure both ranks finish before returning
-        print(f"[Rank {self.rank}] Waiting at final barrier")
+        if verbose:
+            print(f"[Rank {self.rank}] Waiting at final barrier")
         dist.barrier()
-        print(f"[Rank {self.rank}] forward_sequential: END")
+        if verbose:
+            print(f"[Rank {self.rank}] forward_sequential: END")
         
         # Return loss only from last rank
         if self.rank == self.world_size - 1:
@@ -437,7 +452,10 @@ def main():
     parser.add_argument('-l', type=float, default=3e-4)
     parser.add_argument('-v', type=int, default=20)
     parser.add_argument('-m', type=int, default=20)
+    parser.add_argument('--verbose', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
+    
+    verbose = args.verbose
 
     # Initialize distributed
     dist.init_process_group(backend='nccl')
@@ -494,25 +512,29 @@ def main():
     # Optimizer (each rank only optimizes its parameters)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.l, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
     
-    print(f"[Rank {rank}] Starting training loop")
+    if verbose:
+        print(f"[Rank {rank}] Starting training loop")
     total_sum_time = 0.0
     model.train()
     
     # Training loop
     for step in range(train_num_batches + 1):
-        print(f"[Rank {rank}] === Step {step}/{train_num_batches} ===")
+        if verbose:
+            print(f"[Rank {rank}] === Step {step}/{train_num_batches} ===")
         last_step = (step == train_num_batches)
         
         # Validation
         if step % args.v == 0 or last_step:
-            print(f"[Rank {rank}] Running validation")
+            if verbose:
+                print(f"[Rank {rank}] Running validation")
             model.eval()
             val_loss = 0.0
             with torch.no_grad():
                 for i in range(val_num_batches):
-                    print(f"[Rank {rank}] Val batch {i}/{val_num_batches}")
+                    if verbose:
+                        print(f"[Rank {rank}] Val batch {i}/{val_num_batches}")
                     vx, vy = val_loader.next_batch()
-                    _, vloss = model.forward_sequential(vx, vy)
+                    _, vloss = model.forward_sequential(vx, vy, verbose=verbose)
                     if rank == world_size - 1 and vloss is not None:
                         val_loss += vloss.item()
                         
@@ -525,32 +547,42 @@ def main():
             break
             
         # Training step
-        print(f"[Rank {rank}] Training step {step}")
+        if verbose:
+            print(f"[Rank {rank}] Training step {step}")
         if rank == 0:
             t0 = time.time()
         
-        print(f"[Rank {rank}] Loading batch")
+        if verbose:
+            print(f"[Rank {rank}] Loading batch")
         x, y = train_loader.next_batch()
-        print(f"[Rank {rank}] Batch loaded, zeroing gradients")
+        if verbose:
+            print(f"[Rank {rank}] Batch loaded, zeroing gradients")
         optimizer.zero_grad(set_to_none=True)
         
         # Forward pass (barrier-synchronized)
-        print(f"[Rank {rank}] Starting forward pass")
-        logits, loss = model.forward_sequential(x, y)
-        print(f"[Rank {rank}] Forward pass complete")
+        if verbose:
+            print(f"[Rank {rank}] Starting forward pass")
+        logits, loss = model.forward_sequential(x, y, verbose=verbose)
+        if verbose:
+            print(f"[Rank {rank}] Forward pass complete")
         
         # Backward pass (only last rank has loss)
         if rank == world_size - 1 and loss is not None:
-            print(f"[Rank {rank}] Starting backward pass")
+            if verbose:
+                print(f"[Rank {rank}] Starting backward pass")
             loss.backward()
-            print(f"[Rank {rank}] Backward pass complete")
+            if verbose:
+                print(f"[Rank {rank}] Backward pass complete")
         
         # All ranks update their parameters
-        print(f"[Rank {rank}] Waiting at barrier before optimizer.step()")
+        if verbose:
+            print(f"[Rank {rank}] Waiting at barrier before optimizer.step()")
         dist.barrier()
-        print(f"[Rank {rank}] Passed barrier, calling optimizer.step()")
+        if verbose:
+            print(f"[Rank {rank}] Passed barrier, calling optimizer.step()")
         optimizer.step()
-        print(f"[Rank {rank}] optimizer.step() complete")
+        if verbose:
+            print(f"[Rank {rank}] optimizer.step() complete")
         dist.barrier()
         
         if rank == 0:
