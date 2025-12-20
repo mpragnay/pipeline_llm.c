@@ -494,6 +494,8 @@ def main():
     parser.add_argument('-l', type=float, default=3e-4)
     parser.add_argument('-v', type=int, default=20)
     parser.add_argument('-m', type=int, default=20)
+    parser.add_argument('-s', type=int, default=20, help='sample generation every N steps')
+    parser.add_argument('-g', type=int, default=64, help='generation length')
     parser.add_argument('--verbose', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
     
@@ -521,6 +523,10 @@ def main():
         print(f"| batch size B          | {args.b:<50} |")
         print(f"| sequence length T     | {args.t:<50} |")
         print(f"| learning rate         | {args.l:<50.6f} |")
+        print(f"| val_loss_every        | {args.v:<50} |")
+        print(f"| val_max_steps         | {args.m:<50} |")
+        print(f"| sample_every          | {args.s:<50} |")
+        print(f"| genT                  | {args.g:<50} |")
         print(f"| communication         | {'NCCL (barrier-synchronized)':<50} |")
         print(f"| world_size            | {world_size:<50} |")
         print("+-----------------------+----------------------------------------------------+")
@@ -531,6 +537,9 @@ def main():
     
     if rank == 0:
         print("+-----------------------+----------------------------------------------------+")
+    
+    # Tokenizer
+    enc = tiktoken.get_encoding("gpt2")
 
     # Data loaders (rank 0 loads, broadcasts to all)
     train_loader = DataLoader(args.i, args.b, args.t, rank=rank, shuffle=True)
@@ -583,6 +592,48 @@ def main():
             if rank == world_size - 1:
                 val_loss /= val_num_batches
                 print(f"val loss {val_loss:.6f}")
+            model.train()
+        
+        # Sampling (both ranks participate, rank 0 prints)
+        if (step > 0 and step % args.s == 0) or last_step:
+            model.eval()
+            if rank == 0:
+                print("generating:\n---")
+            
+            with torch.no_grad():
+                # Initialize context (rank 0 creates, broadcast to all)
+                ctx = torch.tensor([[50256]], dtype=torch.long, device=f'cuda:{rank}')
+                
+                for t_gen in range(1, args.g):
+                    # Both ranks process the same context
+                    logits, _ = model.forward_sequential(ctx, targets=None, verbose=False)
+                    
+                    # Rank 1 has the logits, samples token, sends to rank 0
+                    if rank == 1:
+                        next_logits = logits[0, -1, :]
+                        probs = F.softmax(next_logits, dim=-1)
+                        idx_tensor = torch.multinomial(probs, 1)
+                        dist.send(idx_tensor.contiguous(), dst=0)
+                    
+                    # Rank 0 receives token and prints
+                    if rank == 0:
+                        idx_tensor = torch.zeros(1, dtype=torch.long, device=model.device)
+                        dist.recv(idx_tensor, src=1)
+                        idx = idx_tensor.item()
+                        try:
+                            print(enc.decode([idx]), end="", flush=True)
+                        except:
+                            print(f"{idx} ", end="", flush=True)
+                    else:
+                        # Rank 1 waits for token index
+                        idx_tensor = torch.zeros(1, dtype=torch.long, device=model.device)
+                    
+                    # Broadcast token from rank 0 to all (so rank 1 can update context too)
+                    dist.broadcast(idx_tensor, src=0)
+                    ctx = torch.cat((ctx, idx_tensor.view(1, 1)), dim=1)
+                
+            if rank == 0:
+                print("\n---\n")
             model.train()
             
         if last_step:
