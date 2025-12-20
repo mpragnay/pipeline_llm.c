@@ -258,61 +258,60 @@ class NCCLPipelineGPT2(nn.Module):
         self.allocate_buffers(B, T)
         C = self.config.n_embd
         
-        # Sequential forward pass (matching NVSHMEM)
-        for target_rank in range(self.world_size):
-            print(f"[Rank {self.rank}] Loop iteration: target_rank={target_rank}")
+        # Process layers in sequence: rank 0, then rank 1
+        # Rank 0 processes first
+        if self.rank == 0:
+            print(f"[Rank {self.rank}] Computing embedding")
+            inputs_device = inputs.to(self.device)
+            pos = torch.arange(0, T, dtype=torch.long, device=self.device)
+            x = self.wte(inputs_device) + self.wpe(pos)
+            print(f"[Rank {self.rank}] Embedding computed")
             
-            if self.rank == target_rank:
-                print(f"[Rank {self.rank}] My turn to process")
-                
-                # Receive from previous rank BEFORE processing (except rank 0)
-                if self.rank > 0:
-                    print(f"[Rank {self.rank}] Waiting to receive from rank {self.rank - 1}")
-                    dist.recv(self.activation_buffer, src=self.rank - 1)
-                    print(f"[Rank {self.rank}] Received from rank {self.rank - 1}")
-                    x = self.activation_buffer.clone()
-                else:
-                    # Rank 0: embedding
-                    print(f"[Rank {self.rank}] Computing embedding")
-                    inputs_device = inputs.to(self.device)
-                    pos = torch.arange(0, T, dtype=torch.long, device=self.device)
-                    x = self.wte(inputs_device) + self.wpe(pos)
-                    print(f"[Rank {self.rank}] Embedding computed")
-                
-                # Process this rank's layers
-                print(f"[Rank {self.rank}] Processing {len(self.blocks)} layers")
-                for i, block in enumerate(self.blocks):
-                    x = block(x)
-                    if i % 2 == 0:
-                        print(f"[Rank {self.rank}] Processed layer {i}")
-                print(f"[Rank {self.rank}] All layers processed")
-                
-                # Send to next rank (except last)
-                if self.rank < self.world_size - 1:
-                    print(f"[Rank {self.rank}] Sending to rank {self.rank + 1}")
-                    dist.send(x.contiguous(), dst=self.rank + 1)
-                    print(f"[Rank {self.rank}] Sent to rank {self.rank + 1}")
-                else:
-                    # Last rank: compute logits and loss
-                    print(f"[Rank {self.rank}] Computing logits and loss")
-                    x = self.ln_f(x)
-                    logits = self.lm_head(x)
-                    
-                    loss = None
-                    if targets is not None:
-                        targets_device = targets.to(self.device)
-                        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_device.view(-1))
-                        print(f"[Rank {self.rank}] Loss computed: {loss.item():.6f}")
-                    
-                    # Store for backward
-                    self.final_logits = logits
-                    self.final_loss = loss
+            print(f"[Rank {self.rank}] Processing {len(self.blocks)} layers")
+            for i, block in enumerate(self.blocks):
+                x = block(x)
+                if i % 2 == 0:
+                    print(f"[Rank {self.rank}] Processed layer {i}")
+            print(f"[Rank {self.rank}] All layers processed")
             
-            print(f"[Rank {self.rank}] Waiting at barrier (target_rank={target_rank})")
-            dist.barrier()  # All ranks wait (matching nvshmem_barrier_all)
-            print(f"[Rank {self.rank}] Passed barrier (target_rank={target_rank})")
+            print(f"[Rank {self.rank}] Sending to rank 1")
+            dist.send(x.contiguous(), dst=1)
+            print(f"[Rank {self.rank}] Sent to rank 1")
         
+        # Rank 1 receives and processes
+        elif self.rank == 1:
+            print(f"[Rank {self.rank}] Waiting to receive from rank 0")
+            dist.recv(self.activation_buffer, src=0)
+            print(f"[Rank {self.rank}] Received from rank 0")
+            x = self.activation_buffer.clone()
+            
+            print(f"[Rank {self.rank}] Processing {len(self.blocks)} layers")
+            for i, block in enumerate(self.blocks):
+                x = block(x)
+                if i % 2 == 0:
+                    print(f"[Rank {self.rank}] Processed layer {i}")
+            print(f"[Rank {self.rank}] All layers processed")
+            
+            # Last rank: compute logits and loss
+            print(f"[Rank {self.rank}] Computing logits and loss")
+            x = self.ln_f(x)
+            logits = self.lm_head(x)
+            
+            loss = None
+            if targets is not None:
+                targets_device = targets.to(self.device)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_device.view(-1))
+                print(f"[Rank {self.rank}] Loss computed: {loss.item():.6f}")
+            
+            # Store for backward
+            self.final_logits = logits
+            self.final_loss = loss
+        
+        # Barrier at end to ensure both ranks finish before returning
+        print(f"[Rank {self.rank}] Waiting at final barrier")
+        dist.barrier()
         print(f"[Rank {self.rank}] forward_sequential: END")
+        
         # Return loss only from last rank
         if self.rank == self.world_size - 1:
             return self.final_logits, self.final_loss
