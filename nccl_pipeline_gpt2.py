@@ -600,11 +600,17 @@ def main():
             if rank == 0:
                 print("generating:\n---")
             
+            # Reduce generation length to avoid timeout during debugging
+            gen_length = min(args.g, 10)
+            
             with torch.no_grad():
                 # Both ranks start with same context
                 ctx = torch.tensor([[50256]], dtype=torch.long, device=f'cuda:{rank}')
                 
-                for t_gen in range(1, args.g):
+                for t_gen in range(1, gen_length):
+                    if rank == 0 and t_gen % 5 == 0:
+                        print(f"[gen {t_gen}/{gen_length}]", flush=True)
+                    
                     # Both ranks process the same context
                     logits, _ = model.forward_sequential(ctx, targets=None, verbose=False)
                     
