@@ -17,7 +17,7 @@ This directory contains two implementations of pipeline parallelism for GPT-2:
 python pipeline_gpt2.py -b 4 -t 1024
 ```
 
-### 2. `nccl_pipeline_gpt2.py` - NCCL-based implementation
+### 2. `nccl_train_gpt2.py` - NCCL-based implementation
 
 - Uses `torch.distributed` with NCCL backend
 - Multi-process architecture (requires 2 GPUs)
@@ -31,10 +31,10 @@ python pipeline_gpt2.py -b 4 -t 1024
 ```bash
 ./run_nccl_pipeline.sh
 # or manually:
-torchrun --standalone --nnodes=1 --nproc_per_node=2 nccl_pipeline_gpt2.py -b 4 -t 1024
+torchrun --standalone --nnodes=1 --nproc_per_node=2 nccl_train_gpt2.py -b 4 -t 1024
 
 # With micro-batching (2 chunks):
-torchrun --standalone --nnodes=1 --nproc_per_node=2 nccl_pipeline_gpt2.py -b 4 -t 1024 -c 2
+torchrun --standalone --nnodes=1 --nproc_per_node=2 nccl_train_gpt2.py -b 4 -t 1024 -c 2
 ```
 
 ### 3. `run_nccl_pipeline.sh` - Launcher script
@@ -106,10 +106,10 @@ To compare `.to()` vs NCCL:
 python pipeline_gpt2.py -b 4 -t 1024 | grep "total average"
 
 # NCCL version (no micro-batching)
-torchrun --standalone --nnodes=1 --nproc_per_node=2 nccl_pipeline_gpt2.py -b 4 -t 1024 -c 1 | grep "total average"
+torchrun --standalone --nnodes=1 --nproc_per_node=2 nccl_train_gpt2.py -b 4 -t 1024 -c 1 | grep "total average"
 
 # NCCL with micro-batching
-torchrun --standalone --nnodes=1 --nproc_per_node=2 nccl_pipeline_gpt2.py -b 8 -t 1024 -c 4 | grep "total average"
+torchrun --standalone --nnodes=1 --nproc_per_node=2 nccl_train_gpt2.py -b 8 -t 1024 -c 4 | grep "total average"
 ```
 
 ## Requirements
